@@ -76,11 +76,20 @@ available on the process path.
 
 ## Useful checks
 
-```bash
-npm run build --prefix backend
-npm run build --prefix frontend
-npm run lint --prefix frontend
-```
+Backend build:
+
+    npm run build --prefix backend
+
+Frontend build:
+
+    NEXT_PUBLIC_SUPABASE_URL=http://localhost:54321 \
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=dummy \
+    NEXT_PUBLIC_API_BASE_URL=http://localhost:3001 \
+    npm run build --prefix frontend
+
+Frontend lint:
+
+    npm run lint --prefix frontend
 
 For test commands and contribution expectations, see
 [Contributing](../CONTRIBUTING.md#testing).
