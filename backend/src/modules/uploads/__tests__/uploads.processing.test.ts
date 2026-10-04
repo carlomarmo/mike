@@ -253,17 +253,16 @@ const baseSession = {
   status: "processing",
 };
 
-async function minimalDocxBytes(): Promise<Buffer> {
-  const zip = new JSZip();
-  zip.file(
-    "[Content_Types].xml",
-    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+async function minimalDocxBytes(
+  contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 </Types>`,
-  );
+): Promise<Buffer> {
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", contentTypesXml);
   zip.file(
     "_rels/.rels",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -401,6 +400,53 @@ describe("upload processing", () => {
 
     expect(mocks.copyFile).not.toHaveBeenCalled();
     expect(db.from).not.toHaveBeenCalled();
+  });
+
+  it("rejects a .docx upload whose content type is not assigned to word/document.xml", async () => {
+    const bytes = await minimalDocxBytes(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <!-- application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml -->
+</Types>`,
+    );
+    mocks.createFileReadStream.mockImplementation(() =>
+      Readable.from([bytes]),
+    );
+
+    await expect(
+      processUploadFile(fakeDb() as never, baseSession, {
+        ...baseFile,
+        filename: "fake.docx",
+        file_type: "docx",
+        content_type:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        expected_size_bytes: bytes.length,
+      }),
+    ).rejects.toThrow("invalid_docx_package");
+
+    expect(mocks.copyFile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a .docx upload with an oversized content-types part", async () => {
+    const bytes = await minimalDocxBytes("x".repeat(256 * 1024 + 1));
+    mocks.createFileReadStream.mockImplementation(() =>
+      Readable.from([bytes]),
+    );
+
+    await expect(
+      processUploadFile(fakeDb() as never, baseSession, {
+        ...baseFile,
+        filename: "fake.docx",
+        file_type: "docx",
+        content_type:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        expected_size_bytes: bytes.length,
+      }),
+    ).rejects.toThrow("invalid_docx_package");
+
+    expect(mocks.copyFile).not.toHaveBeenCalled();
   });
 
   it("keeps the upload and reports a missing LibreOffice once, as a warning grouped by file type", async () => {

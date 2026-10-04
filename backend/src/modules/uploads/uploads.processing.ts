@@ -22,6 +22,7 @@ import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 import JSZip from "jszip";
+import { XMLParser } from "fast-xml-parser";
 
 import { resolveContentOrgId } from "../../lib/access";
 import { recordAudit } from "../../lib/audit";
@@ -322,6 +323,38 @@ async function requireSealedFile(
 
 const DOCX_MAIN_DOCUMENT_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+const DOCX_CONTENT_TYPES_MAX_BYTES = 256 * 1024;
+const contentTypesParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+});
+
+type DocxContentTypeOverride = {
+  "@_PartName"?: string;
+  "@_ContentType"?: string;
+};
+
+function zipEntryUncompressedSize(entry: JSZip.JSZipObject): number | null {
+  const data = (entry as JSZip.JSZipObject & {
+    _data?: { uncompressedSize?: unknown };
+  })._data;
+  const size = data?.uncompressedSize;
+  return typeof size === "number" && Number.isFinite(size) ? size : null;
+}
+
+function hasDocxMainDocumentOverride(contentTypes: string): boolean {
+  const parsed = contentTypesParser.parse(contentTypes) as {
+    Types?: {
+      Override?: DocxContentTypeOverride | DocxContentTypeOverride[];
+    };
+  };
+  const overrides = parsed.Types?.Override;
+  return (Array.isArray(overrides) ? overrides : overrides ? [overrides] : []).some(
+    (override) =>
+      override["@_PartName"] === "/word/document.xml" &&
+      override["@_ContentType"] === DOCX_MAIN_DOCUMENT_CONTENT_TYPE,
+  );
+}
 
 async function validateUploadedFilePackage(
   file: UploadFileRow,
@@ -339,8 +372,16 @@ async function validateUploadedFilePackage(
       throw new InvalidUploadedFileError();
     }
 
+    const contentTypesSize = zipEntryUncompressedSize(contentTypesPart);
+    if (
+      contentTypesSize === null ||
+      contentTypesSize > DOCX_CONTENT_TYPES_MAX_BYTES
+    ) {
+      throw new InvalidUploadedFileError();
+    }
+
     const contentTypes = await contentTypesPart.async("string");
-    if (!contentTypes.includes(DOCX_MAIN_DOCUMENT_CONTENT_TYPE)) {
+    if (!hasDocxMainDocumentOverride(contentTypes)) {
       throw new InvalidUploadedFileError();
     }
   } catch (error) {
