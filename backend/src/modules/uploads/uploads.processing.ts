@@ -14,12 +14,15 @@ import {
 
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
+
+import JSZip from "jszip";
+import { XMLParser } from "fast-xml-parser";
 
 import { resolveContentOrgId } from "../../lib/access";
 import { recordAudit } from "../../lib/audit";
@@ -32,11 +35,11 @@ import {
 } from "../../lib/observability/pollFailureGate";
 import { asReportableError } from "../../lib/httpError";
 import { shouldConvertToPdf } from "../../lib/documentTypes";
-import { countPagesWithoutText } from "../../lib/pdfText";
 import { uploadJobWallClockMs } from "../../lib/runtimeConfig";
 import {
   copyFile,
   createFileReadStream,
+  deleteFile,
   deleteFileBestEffort,
   deleteFilesBestEffort,
   StorageOperationError,
@@ -45,7 +48,10 @@ import {
   versionStorageKey,
 } from "../../lib/storage";
 import { createServerSupabase, type Db } from "../../lib/supabase";
-import { UPLOAD_VERIFICATION_LEASE_SECONDS } from "./uploads.manifest";
+import {
+  MAX_UPLOAD_SIZE_BYTES,
+  UPLOAD_VERIFICATION_LEASE_SECONDS,
+} from "./uploads.manifest";
 
 type UploadSessionRow = {
   id: string;
@@ -102,6 +108,7 @@ const TERMINAL_UPLOAD_ERROR_CODES = new Set([
   "direct_upload_failed",
   "size_mismatch",
   "content_type_mismatch",
+  "invalid_docx_package",
   // The destination document no longer exists. Retrying cannot make it exist
   // again — it can only put it back, which is the bug this code prevents.
   "document_deleted",
@@ -133,6 +140,15 @@ class ChangedDocumentError extends Error {
   constructor(readonly orphanedKeys: string[] = []) {
     super("document_changed");
     this.name = "ChangedDocumentError";
+  }
+}
+
+class InvalidUploadedFileError extends Error {
+  readonly code = "invalid_docx_package" as const;
+
+  constructor() {
+    super("invalid_docx_package");
+    this.name = "InvalidUploadedFileError";
   }
 }
 
@@ -184,22 +200,6 @@ async function countPdfPages(filePath: string): Promise<number | null> {
   }
 }
 
-// Measured once at upload so the document list can flag scanned PDFs without
-// re-reading them. Null when the PDF cannot be parsed.
-async function countTextlessPdfPages(filePath: string): Promise<number | null> {
-  try {
-    const bytes = await readFile(filePath);
-    return await countPagesWithoutText(
-      bytes.buffer.slice(
-        bytes.byteOffset,
-        bytes.byteOffset + bytes.byteLength,
-      ) as ArrayBuffer,
-    );
-  } catch {
-    return null;
-  }
-}
-
 async function buildPdfRendition(args: {
   sourceFilePath: string;
   workingDirectory: string;
@@ -216,11 +216,9 @@ async function buildPdfRendition(args: {
       args.sourceFilePath,
       args.workingDirectory,
     );
-    const key = convertedPdfKey(
-      args.userId,
-      args.documentId,
-      args.versionSlug,
-    );
+    const key = args.versionSlug
+      ? `converted-pdfs/${args.userId}/${args.documentId}/${args.versionSlug}.pdf`
+      : convertedPdfKey(args.userId, args.documentId);
     await uploadFileFromPath(key, pdfPath, "application/pdf");
     return key;
   } catch (error) {
@@ -323,6 +321,133 @@ async function requireSealedFile(
       throw new Error("sealed_upload_not_found", { cause: error });
     }
     throw error;
+  }
+}
+
+const DOCX_MAIN_DOCUMENT_CONTENT_TYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+const DOCX_CONTENT_TYPES_MAX_BYTES = 256 * 1024;
+const contentTypesParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+});
+
+type DocxContentTypeOverride = {
+  "@_PartName"?: string;
+  "@_ContentType"?: string;
+};
+
+function zipEntryUncompressedSize(entry: JSZip.JSZipObject): number | null {
+  const data = (entry as JSZip.JSZipObject & {
+    _data?: { uncompressedSize?: unknown };
+  })._data;
+  const size = data?.uncompressedSize;
+  return typeof size === "number" && Number.isFinite(size) ? size : null;
+}
+
+type BoundedZipEntryStream = {
+  on(event: "data", listener: (chunk: Buffer) => void): BoundedZipEntryStream;
+  on(event: "error", listener: (error: unknown) => void): BoundedZipEntryStream;
+  on(event: "end", listener: () => void): BoundedZipEntryStream;
+  pause(): void;
+  resume(): void;
+};
+
+async function readZipEntryBounded(
+  entry: JSZip.JSZipObject,
+  maxBytes: number,
+): Promise<string> {
+  const declaredSize = zipEntryUncompressedSize(entry);
+  if (
+    declaredSize === null ||
+    declaredSize < 0 ||
+    declaredSize > maxBytes
+  ) {
+    throw new InvalidUploadedFileError();
+  }
+
+  const chunks: Buffer[] = [];
+  let actualSize = 0;
+  const stream = entry.internalStream("nodebuffer") as unknown as BoundedZipEntryStream;
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    stream.on("data", (chunk) => {
+      if (settled) return;
+      actualSize += chunk.byteLength;
+      if (actualSize > maxBytes) {
+        settled = true;
+        stream.pause();
+        reject(new InvalidUploadedFileError());
+        return;
+      }
+      chunks.push(chunk);
+    });
+    stream.on("error", () => {
+      if (settled) return;
+      settled = true;
+      reject(new InvalidUploadedFileError());
+    });
+    stream.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+    stream.resume();
+  });
+
+  if (actualSize !== declaredSize) {
+    throw new InvalidUploadedFileError();
+  }
+  return Buffer.concat(chunks, actualSize).toString("utf8");
+}
+
+function hasDocxMainDocumentOverride(contentTypes: string): boolean {
+  const parsed = contentTypesParser.parse(contentTypes) as {
+    Types?: {
+      Override?: DocxContentTypeOverride | DocxContentTypeOverride[];
+    };
+  };
+  const overrides = parsed.Types?.Override;
+  return (Array.isArray(overrides) ? overrides : overrides ? [overrides] : []).some(
+    (override) =>
+      override["@_PartName"] === "/word/document.xml" &&
+      override["@_ContentType"] === DOCX_MAIN_DOCUMENT_CONTENT_TYPE,
+  );
+}
+
+async function validateUploadedFilePackage(
+  file: UploadFileRow,
+  artifact: SealedFileArtifact,
+): Promise<void> {
+  if (file.file_type !== "docx") return;
+
+  try {
+    // The manifest caps uploads at 100 MiB. Enforce that policy before
+    // loading the sealed archive into memory for ZIP parsing.
+    if (artifact.size > MAX_UPLOAD_SIZE_BYTES) {
+      throw new InvalidUploadedFileError();
+    }
+
+    const zip = await JSZip.loadAsync(await readFile(artifact.filePath));
+    const contentTypesPart = zip.file("[Content_Types].xml");
+    const relationshipsPart = zip.file("_rels/.rels");
+    const documentPart = zip.file("word/document.xml");
+
+    if (!contentTypesPart || !relationshipsPart || !documentPart) {
+      throw new InvalidUploadedFileError();
+    }
+
+    const contentTypes = await readZipEntryBounded(
+      contentTypesPart,
+      DOCX_CONTENT_TYPES_MAX_BYTES,
+    );
+    if (!hasDocxMainDocumentOverride(contentTypes)) {
+      throw new InvalidUploadedFileError();
+    }
+  } catch (error) {
+    if (error instanceof InvalidUploadedFileError) throw error;
+    throw new InvalidUploadedFileError();
   }
 }
 
@@ -445,10 +570,6 @@ async function processCreatedDocument(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
-  const textlessPageCount =
-    file.file_type === "pdf"
-      ? await countTextlessPdfPages(artifact.filePath)
-      : null;
 
   const { error: versionError } = await createDocumentVersion(db, {
     id: versionId,
@@ -461,7 +582,6 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
-    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // The document went while we were converting: stop, and hand the bytes we
@@ -506,7 +626,6 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
-    textless_page_count: textlessPageCount,
     active_version_number: 1,
   };
 }
@@ -541,10 +660,6 @@ async function processNewDocumentVersion(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
-  const textlessPageCount =
-    file.file_type === "pdf"
-      ? await countTextlessPdfPages(artifact.filePath)
-      : null;
 
   const { data: version, error } = await createDocumentVersion(db, {
     id: versionId,
@@ -557,7 +672,6 @@ async function processNewDocumentVersion(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
-    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // Adding a version to a document that has been deleted is the same race as
@@ -576,7 +690,6 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
-    textless_page_count,
   } = version;
   return {
     id,
@@ -587,7 +700,6 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
-    textless_page_count,
   };
 }
 
@@ -658,10 +770,6 @@ async function processReplacementDocumentVersion(
       });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
-  const textlessPageCount =
-    file.file_type === "pdf"
-      ? await countTextlessPdfPages(artifact.filePath)
-      : null;
   const { data: updated, error } = await updateDocumentVersion(
     db,
     documentId,
@@ -673,7 +781,6 @@ async function processReplacementDocumentVersion(
       file_type: file.file_type,
       size_bytes: artifact.size,
       page_count: pageCount,
-      textless_page_count: textlessPageCount,
       content_sha256: artifact.sha256,
       created_at: new Date().toISOString(),
     },
@@ -697,6 +804,7 @@ export async function processUploadFile(
 ) {
   const artifact = await requireSealedFile(file);
   try {
+    await validateUploadedFilePackage(file, artifact);
     switch (session.purpose) {
       case "document_create":
         return await processCreatedDocument(db, session, file, artifact);
@@ -894,8 +1002,11 @@ export async function processUploadJob(
         await heartbeatJob(db, jobId, workerId);
         failed = true;
         // These failures cannot be fixed by retrying the same upload.
-        terminalProcessingFailure = error instanceof DeletedDocumentError || error instanceof ChangedDocumentError;
-        if (!(error instanceof ChangedDocumentError)) {
+        terminalProcessingFailure =
+          error instanceof DeletedDocumentError ||
+          error instanceof ChangedDocumentError ||
+          error instanceof InvalidUploadedFileError;
+        if (!(error instanceof ChangedDocumentError || error instanceof InvalidUploadedFileError)) {
           reportError(error, {
             tags: {
               component: "upload-worker",
@@ -922,8 +1033,11 @@ export async function processUploadJob(
             status: "error",
             error_code: error instanceof ChangedDocumentError
               ? "document_changed"
-              : error instanceof DeletedDocumentError ? "document_deleted"
-              : "processing_failed",
+              : error instanceof DeletedDocumentError
+                ? "document_deleted"
+                : error instanceof InvalidUploadedFileError
+                  ? error.code
+                  : "processing_failed",
             updated_at: new Date().toISOString(),
           })
           .eq("id", file.id)
