@@ -694,6 +694,7 @@ describe("upload processing", () => {
         content_sha256: createHash("sha256").update(officeBytes).digest("hex"),
         pdf_storage_path: generatePdf === false ? null : expect.stringContaining("converted-pdfs/"),
         page_count: null,
+        textless_page_count: null,
       }),
     }));
   });
