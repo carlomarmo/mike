@@ -781,6 +781,9 @@ async function processReplacementDocumentVersion(
       file_type: file.file_type,
       size_bytes: artifact.size,
       page_count: pageCount,
+      // This value belongs to the previous file's extracted text. Replacement
+      // uploads do not recompute it, so retaining it would expose stale metadata.
+      textless_page_count: null,
       content_sha256: artifact.sha256,
       created_at: new Date().toISOString(),
     },
