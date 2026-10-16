@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import { streamRunDeadlines } from "./runtimeConfig";
 
 /**
  * Server-owned streaming runs.
@@ -29,8 +30,49 @@ import type { Response } from "express";
  */
 
 export const FINISHED_RUN_RETENTION_MS = 60_000;
-/** A safety net, not a feature: the work is bounded, but a hung provider is not. */
-export const MAX_RUN_LIFETIME_MS = 30 * 60_000;
+/**
+ * Defaults for the two run deadlines (see `streamRunDeadlines` in
+ * runtimeConfig.ts for the env overrides). The idle deadline catches a hung
+ * provider or tool: useful model progress and data frames re-arm it, while
+ * transport keep-alives do not. The lifetime is a backstop for a
+ * run that emits forever.
+ */
+export const MAX_RUN_LIFETIME_MS = 4 * 60 * 60_000;
+export const IDLE_RUN_TIMEOUT_MS = 5 * 60_000;
+
+/** Why a run was stopped. Only "user" is an explicit cancel. */
+export type StreamStopReason = "user" | "idle" | "max_lifetime";
+
+/** The terminal SSE records for a run that hit one of its deadlines. */
+export function deadlineMessage(reason: Exclude<StreamStopReason, "user">): string {
+    return reason === "idle"
+        ? "The request timed out because it stopped responding. Please try again."
+        : "The request ran longer than the maximum allowed time and was stopped.";
+}
+
+export function deadlineFrames(reason: Exclude<StreamStopReason, "user">): string[] {
+    return [
+        `data: ${JSON.stringify({
+            type: "error",
+            message: deadlineMessage(reason),
+            safe_to_display: true,
+        })}\n\n`,
+        "data: [DONE]\n\n",
+    ];
+}
+
+/**
+ * The outcome record a route writes after it unwinds from an abort: `cancelled`
+ * for an explicit Stop, an error for a deadline. (A route writes `[DONE]`
+ * itself.)
+ */
+export function stopOutcomeFrame(
+    run: { readonly stopReason: StreamStopReason | null } | null | undefined,
+): string {
+    return !run || run.stopReason === null || run.stopReason === "user"
+        ? `data: ${JSON.stringify({ type: "cancelled" })}\n\n`
+        : deadlineFrames(run.stopReason)[0];
+}
 /**
  * How long a STOPPED run may take to finish on its own before the registry
  * finishes it. `stop()` only aborts the signal; the route is expected to unwind,
@@ -78,16 +120,23 @@ export type StreamRun<Meta = Record<string, unknown>> = {
     readonly seq: number;
     readonly finished: boolean;
     readonly stopped: boolean;
+    /** Why `stop()` was called; null while the run has not been stopped. */
+    readonly stopReason: StreamStopReason | null;
     /**
      * Append one SSE record (`data: ...\n\n`) and fan it out. A COMMENT line
      * (one starting with `:`) is fanned out live but neither buffered nor
      * numbered — it is a keep-alive, not content.
      */
     write: (line: string, opts?: StreamRunWriteOptions) => boolean;
+    /** Mark useful progress which does not need a client-facing frame. */
+    touch: () => void;
     /** The work is over: end every attached response and start the retention clock. */
     finish: () => void;
-    /** Explicit cancel: abort the work. The route decides what to persist. */
-    stop: () => void;
+    /**
+     * Abort the work. The route decides what to persist. `reason` defaults to
+     * an explicit user cancel; the registry's own deadlines pass theirs.
+     */
+    stop: (reason?: StreamStopReason) => void;
     /**
      * Replay frames with `seq >= from` (skipping any whose replay predicate no
      * longer holds), then tail. The subscriber is ended when the run finishes.
@@ -102,6 +151,7 @@ type RunRecord<Meta> = StreamRun<Meta> & {
     controller: AbortController;
     retention: ReturnType<typeof setTimeout> | null;
     lifetime: ReturnType<typeof setTimeout> | null;
+    idle: ReturnType<typeof setTimeout> | null;
     grace: ReturnType<typeof setTimeout> | null;
 };
 
@@ -121,6 +171,7 @@ function remove(run: StoredRun) {
     if (run.retention) clearTimeout(run.retention);
     if (run.lifetime) clearTimeout(run.lifetime);
     if (run.grace) clearTimeout(run.grace);
+    if (run.idle) clearTimeout(run.idle);
     runs.delete(run.id);
     if (runsByKey.get(run.key) === run) runsByKey.delete(run.key);
 }
@@ -153,6 +204,13 @@ export function startStreamRun<Meta = Record<string, unknown>>(args: {
     let seq = 0;
     let finished = false;
     let stopped = false;
+    let stopReason: StreamStopReason | null = null;
+    const deadlines = streamRunDeadlines();
+    const armIdle = () => {
+        if (run.idle) clearTimeout(run.idle);
+        run.idle = setTimeout(() => run.stop("idle"), deadlines.idleMs);
+        run.idle.unref?.();
+    };
     const run: RunRecord<Meta> = {
         id: args.id,
         key: args.key,
@@ -169,14 +227,23 @@ export function startStreamRun<Meta = Record<string, unknown>>(args: {
         get stopped() {
             return stopped;
         },
+        get stopReason() {
+            return stopReason;
+        },
         frames: [],
         subscribers: new Set(),
         controller,
         retention: null,
         lifetime: null,
+        idle: null,
         grace: null,
+        touch() {
+            if (!finished && !stopped) armIdle();
+        },
         write(line: string, opts?: StreamRunWriteOptions) {
             if (finished) return false;
+            // Transport keep-alives do not prove useful work is progressing.
+            if (!line.startsWith(":")) run.touch();
             // SSE COMMENT lines (`: tool-wait`) are not records: they carry
             // no payload, exist only to stop an intermediary idling the
             // connection out, and mean nothing to a client that arrives
@@ -220,20 +287,32 @@ export function startStreamRun<Meta = Record<string, unknown>>(args: {
             run.subscribers.clear();
             if (run.lifetime) clearTimeout(run.lifetime);
             run.lifetime = null;
+            if (run.idle) clearTimeout(run.idle);
+            run.idle = null;
             if (run.grace) clearTimeout(run.grace);
             run.grace = null;
             run.retention = setTimeout(() => remove(run), FINISHED_RUN_RETENTION_MS);
             run.retention.unref?.();
         },
-        stop() {
+        stop(reason: StreamStopReason = "user") {
             if (finished || stopped) return;
             stopped = true;
+            stopReason = reason;
+            if (run.lifetime) clearTimeout(run.lifetime);
+            run.lifetime = null;
+            if (run.idle) clearTimeout(run.idle);
+            run.idle = null;
             controller.abort();
+            if (finished) return;
             // The route owns the orderly ending; this is the disorderly one.
             // Whatever it is still awaiting, the key is free again after the
             // grace period and attached readers get their terminal frame.
             run.grace = setTimeout(() => {
-                for (const frame of args.forcedStopFrames) run.write(frame);
+                const frames =
+                    reason === "user"
+                        ? args.forcedStopFrames
+                        : deadlineFrames(reason);
+                for (const frame of frames) run.write(frame);
                 run.finish();
             }, STOPPED_RUN_GRACE_MS);
             run.grace.unref?.();
@@ -253,8 +332,9 @@ export function startStreamRun<Meta = Record<string, unknown>>(args: {
             };
         },
     };
-    run.lifetime = setTimeout(() => run.stop(), MAX_RUN_LIFETIME_MS);
+    run.lifetime = setTimeout(() => run.stop("max_lifetime"), deadlines.maxMs);
     run.lifetime.unref?.();
+    armIdle();
     runs.set(run.id, run as StoredRun);
     runsByKey.set(run.key, run as StoredRun);
     return run;

@@ -1,7 +1,9 @@
+import { abortable } from "../../lib/abortable";
 import {
     attachAssistantTurnSse,
     startAssistantTurnRun,
 } from "../../lib/assistantTurnRuns";
+import { stopOutcomeFrame } from "../../lib/streamRuns";
 // HTTP layer for the project-chat module.
 //
 // The route handler parses the request body, calls
@@ -19,8 +21,7 @@ import {
     appendAssistantEventsToMessage,
     AssistantStreamError,
     assistantStreamErrorPayload,
-    ASSISTANT_ERROR_MESSAGE,
-    buildCancelledAssistantMessage,
+    buildStoppedAssistantMessage,
     extractCitations,
     isAbortError,
 
@@ -145,6 +146,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         workflowStore,
         legalResearchUs,
         apiKeys,
+        orgId,
         titleModel,
         selectedModel,
         selectedReasoningLevel,
@@ -212,11 +214,13 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 : "";
             titlePromise = shouldGenerateTitle
                 ? generateAssistantChatTitle({
+                      abortSignal: stream.signal,
                       model: titleModelForChat(selectedModel, titleModel),
                       message: titleMessage,
                       apiKeys,
                   })
                       .then(async (title) => {
+                          if (stream.signal.aborted) return;
                           const saved = await updateChatTitle(db, {
                               chatId,
                               title,
@@ -232,15 +236,17 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                       .catch((error) => {
                           // Decided once the reply has settled: see the
                           // logChatTitleFailure calls below.
-                          titleOutcome.failure = { error };
+                          if (!stream.signal.aborted) titleOutcome.failure = { error };
                       })
                 : Promise.resolve();
 
             const { events, citations } = await runLLMStream({
+                onActivity: run?.touch,
                 apiMessages,
                 docStore,
                 docIndex,
                 userId,
+                userEmail,
                 db,
                 write,
                 extraTools: PROJECT_EXTRA_TOOLS,
@@ -253,6 +259,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 model: selectedModel,
                 reasoning: selectedReasoningLevel,
                 apiKeys,
+                orgId,
                 signal: stream.signal,
                 projectId,
                 conversationId: chatId,
@@ -301,7 +308,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 }
             }
 
-            await titlePromise;
+            await abortable(titlePromise, stream.signal).catch(() => {});
             if (titleOutcome.failure) {
                 logChatTitleFailure(
                     "[project-chat/stream] failed to generate chat title",
@@ -353,6 +360,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 db,
                 {
                     userId,
+                    orgId,
                     userEmail,
                     chatId,
                     projectId,
@@ -366,7 +374,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         } catch (err) {
             // The title ran in parallel with the reply; only now is it known
             // whether its failure is the reply's failure seen twice.
-            await titlePromise;
+            await abortable(titlePromise, stream.signal).catch(() => {});
             if (titleOutcome.failure) {
                 logChatTitleFailure(
                     "[project-chat/stream] failed to generate chat title",
@@ -379,7 +387,8 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                     chatId,
                 });
                 if (err instanceof AssistantStreamError) {
-                    const partial = buildCancelledAssistantMessage({
+                    const partial = buildStoppedAssistantMessage({
+                        stopReason: run?.stopReason,
                         fullText: err.fullText,
                         events: err.events,
                         buildCitations: (fullText) =>
@@ -413,7 +422,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                         );
                     }
                 }
-                write(`data: ${JSON.stringify({ type: "cancelled" })}\n\n`);
+                write(stopOutcomeFrame(run));
                 write("data: [DONE]\n\n");
                 return;
             }

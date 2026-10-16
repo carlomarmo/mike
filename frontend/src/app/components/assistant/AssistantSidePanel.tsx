@@ -11,9 +11,11 @@ import { useDocumentViewers } from "@/app/hooks/useDocumentViewers";
 import { useDocumentPermissions } from "@/app/hooks/useDocumentPermissions";
 import { type DocumentActions } from "../shared/DocumentTabActions";
 import type { DocumentVersion } from "@/app/lib/mikeApi";
-import Image from "next/image";
+import { SvgAssetIcon } from "@/app/components/ui/svg-asset-icon";
+import caseLaw from "../../../../public/icons/legal-sources/case-law.svg";
+import legislation from "../../../../public/icons/legal-sources/legislation.svg";
 import { BookOpenText } from "lucide-react";
-import { DocPanel, type DocPanelMode } from "./DocPanel";
+import { DocumentContent, type DocumentContentMode } from "@/app/components/shared/DocumentContent";
 import { DocumentTabBar } from "../shared/DocumentTabBar";
 import type { Citation, EditAnnotation, PanelDocument } from "../shared/types";
 import { cn } from "@/app/lib/utils";
@@ -139,7 +141,7 @@ interface Props {
     ) => void;
     /**
      * Parent-driven reloading flag per document. Download buttons in
-     * DocPanel show a spinner iff this returns true for the tab's
+     * DocumentContent show a spinner iff this returns true for the tab's
      * documentId. Used to signal "accept/reject in flight".
      */
     isEditorReloading?: (documentId: string) => boolean;
@@ -179,17 +181,45 @@ interface Props {
      * nothing; with it the panel stays open on an "Open Documents" placeholder.
      */
     onOpenDocuments?: () => void;
+    /**
+     * How many chats share the page with the panel. Each keeps its minimum
+     * width, and beside two chats the panel opens at two fifths of the page
+     * rather than half.
+     */
+    chatCount?: number;
 }
 
 const MIN_WIDTH = 300;
 const MAX_WIDTH_OFFSET = 56; // sidebar width
 const MIN_CHAT_WIDTH = 400;
-function maxPanelWidth() {
-    if (typeof window === "undefined") return 600;
+
+/** The widest the panel may be while every chat keeps its minimum width. */
+export function maxAssistantSidePanelWidth(
+    viewportWidth: number,
+    chatCount: number,
+): number {
     return Math.max(
         MIN_WIDTH,
-        window.innerWidth - MAX_WIDTH_OFFSET - MIN_CHAT_WIDTH,
+        viewportWidth - MAX_WIDTH_OFFSET - MIN_CHAT_WIDTH * chatCount,
     );
+}
+
+/** The width the panel opens at: half the page, or two fifths beside two chats. */
+export function defaultAssistantSidePanelWidth(
+    viewportWidth: number,
+    chatCount: number,
+): number {
+    return Math.min(
+        maxAssistantSidePanelWidth(viewportWidth, chatCount),
+        Math.round(
+            (viewportWidth - MAX_WIDTH_OFFSET) * (chatCount > 1 ? 2 / 5 : 1 / 2),
+        ),
+    );
+}
+
+function maxPanelWidth(chatCount: number) {
+    if (typeof window === "undefined") return 600;
+    return maxAssistantSidePanelWidth(window.innerWidth, chatCount);
 }
 
 export function AssistantSidePanel({
@@ -211,18 +241,23 @@ export function AssistantSidePanel({
     onCloseAnnotation,
     onScrollChange,
     onOpenDocuments,
+    chatCount = 1,
 }: Props) {
     const panelRef = useRef<HTMLDivElement>(null);
     const permissions = useDocumentPermissions(tabs.filter((tab) => !["case", "legislation"].includes(tab.document.type)).map((tab) => tab.document.document_id), canEdit);
     const viewers = useDocumentViewers();
-    const [panelWidth, setPanelWidth] = useState(() =>
+    // One width beside a single chat and another beside two, so closing the
+    // second chat gives the panel back the width it had before.
+    const split = chatCount > 1;
+    const [panelWidths, setPanelWidths] = useState(() =>
         typeof window !== "undefined"
-            ? Math.min(
-                  maxPanelWidth(),
-                  Math.round((window.innerWidth - MAX_WIDTH_OFFSET) / 2),
-              )
-            : 600,
+            ? {
+                  single: defaultAssistantSidePanelWidth(window.innerWidth, 1),
+                  split: defaultAssistantSidePanelWidth(window.innerWidth, 2),
+              }
+            : { single: 600, split: 400 },
     );
+    const panelWidth = split ? panelWidths.split : panelWidths.single;
 
     const dragStartX = useRef<number>(0);
     const dragStartWidth = useRef<number>(0);
@@ -235,11 +270,14 @@ export function AssistantSidePanel({
 
             const onMouseMove = (ev: MouseEvent) => {
                 const delta = dragStartX.current - ev.clientX;
-                setPanelWidth(
-                    Math.min(
-                        maxPanelWidth(),
-                        Math.max(MIN_WIDTH, dragStartWidth.current + delta),
-                    ),
+                const width = Math.min(
+                    maxPanelWidth(chatCount),
+                    Math.max(MIN_WIDTH, dragStartWidth.current + delta),
+                );
+                setPanelWidths((current) =>
+                    split
+                        ? { ...current, split: width }
+                        : { ...current, single: width },
                 );
             };
             const onMouseUp = () => {
@@ -254,14 +292,23 @@ export function AssistantSidePanel({
             document.body.style.cursor = "col-resize";
             document.body.style.userSelect = "none";
         },
-        [panelWidth],
+        [panelWidth, chatCount, split],
     );
 
     useEffect(() => {
+        const fit = (width: number, chats: number) =>
+            Math.min(maxPanelWidth(chats), Math.max(MIN_WIDTH, width));
         const onResize = () => {
-            setPanelWidth((width) =>
-                Math.min(maxPanelWidth(), Math.max(MIN_WIDTH, width)),
-            );
+            setPanelWidths((current) => {
+                const next = {
+                    single: fit(current.single, 1),
+                    split: fit(current.split, 2),
+                };
+                return next.single === current.single &&
+                    next.split === current.split
+                    ? current
+                    : next;
+            });
         };
         window.addEventListener("resize", onResize);
         onResize();
@@ -276,7 +323,7 @@ export function AssistantSidePanel({
             ref={panelRef}
             className={cn(
                 "relative flex h-full w-full shrink-0 flex-col md:my-3 md:mr-3 md:h-[calc(100%-1.5rem)] md:w-[var(--assistant-panel-width)]",
-                "rounded-2xl backdrop-blur-2xl",
+                "rounded-2xl",
                 LIQUID_GLASS_FLOAT_CLASS,
                 "overflow-hidden",
             )}
@@ -318,13 +365,12 @@ export function AssistantSidePanel({
                         title: tab.document.title,
                         versionNumber: tab.document.version_number,
                         icon: isLegalSource ? (
-                            <Image
+                            <SvgAssetIcon
                                 src={
                                     tab.document.type === "case"
-                                        ? "/icons/legal-sources/case-law.svg"
-                                        : "/icons/legal-sources/legislation.svg"
+                                        ? caseLaw
+                                        : legislation
                                 }
-                                alt=""
                                 aria-hidden="true"
                                 width={14}
                                 height={14}
@@ -350,7 +396,7 @@ export function AssistantSidePanel({
                         <button
                             type="button"
                             onClick={onOpenDocuments}
-                            className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300"
+                            className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
                         >
                             <BookOpenText aria-hidden="true" className="h-4 w-4" />
                             Open Documents
@@ -359,7 +405,7 @@ export function AssistantSidePanel({
                 ) : null}
                 {tabs.map((tab) => {
                     const isActive = tab.id === active?.id;
-                    const mode: DocPanelMode =
+                    const mode: DocumentContentMode =
                         tab.kind === "citation"
                             ? {
                                   kind: "citation",
@@ -388,7 +434,7 @@ export function AssistantSidePanel({
                             aria-hidden={!isActive}
                             inert={!isActive}
                         >
-                            <DocPanel
+                            <DocumentContent
                                 showToolbarToggle
                                 canEdit={permissions(tab.document.document_id).canEdit}
                                 onDownloadReady={(download) => viewers.registerDownload(tab.id, download)}

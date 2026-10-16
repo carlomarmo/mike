@@ -27,7 +27,7 @@ function isLoginMfaBootstrapRoute(req: Request) {
   }
   return (
     (req.method === "GET" || req.method === "POST") &&
-    (path === "/user/profile" || path === "/users/profile")
+    path === "/user/profile"
   );
 }
 
@@ -160,8 +160,30 @@ export async function requireAuth(
     return;
   }
 
+  const { data: deletionProfile, error: deletionError } = await admin
+    .from("user_profiles")
+    .select("account_deletion_requested_at")
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (deletionError) {
+    sendInternalError(res, deletionError);
+    return;
+  }
+  if (deletionProfile?.account_deletion_requested_at) {
+    res.status(401).json({ code: "account_deletion_pending", detail: "This account is being deleted." });
+    return;
+  }
+
   res.locals.userId = user.id;
-  res.locals.userEmail = user.email?.toLowerCase() ?? "";
+  // `userEmail` is an AUTHORIZATION input, not a display value: direct grants
+  // (projects, chats, reviews, workflows) and organization invitations are
+  // all matched against it. An address the account has not proved it owns
+  // must therefore match nothing — otherwise signing up as someone else's
+  // address (before they do) inherits whatever was shared or extended to it.
+  // Such a session still authenticates; it only stops matching email-keyed
+  // grants until the address is confirmed.
+  res.locals.userEmail =
+    user.email && user.email_confirmed_at ? user.email.toLowerCase() : "";
   res.locals.token = token;
   // Id only — enough for "how many users are affected", never the email.
   setCurrentUser(user.id);

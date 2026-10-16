@@ -1,22 +1,29 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { SettingsCard } from "./SettingsCard";
+import { GlassCardUI } from "@/shared/ui/GlassCardUI";
 import { SettingsLabel } from "./SettingsText";
 
 /**
- * One connector tile, shared by Installed and Discover so both lists have the
- * same size and layout: icon, name, and a single trailing control (the on/off
- * switch or the Add button). With `onOpen` the tile opens the Manage dialog.
+ * One settings tile, shared by the connector lists (Installed and Discover)
+ * and the model provider lists so they all have the same size and layout:
+ * icon, name, and a single trailing control (the on/off switch or the Add
+ * button). With `onOpen` the tile opens the Manage dialog.
  */
 export function ConnectorCard({
   name,
+  detail,
   icon,
   placeholderClassName,
   onOpen,
   action,
+  kind = "connector",
 }: {
   name: string;
+  /** A second line under the name, for a tile with more to say about itself. */
+  detail?: ReactNode;
+  /** What the tile holds, for its accessible name ("Slack connector"). */
+  kind?: string;
   /** Brand icon; without one a small coloured shape is shown. */
   icon?: ReactNode;
   placeholderClassName?: string;
@@ -35,26 +42,34 @@ export function ConnectorCard({
             />
           )}
         </div>
-        <div className="min-w-0 flex-1 text-left">
+        <div className="min-w-0 flex-1 break-words text-left">
           <SettingsLabel>{name}</SettingsLabel>
+          {detail ? (
+            <p className="text-xs break-words text-gray-500">{detail}</p>
+          ) : null}
         </div>
       </div>
-      {/* The control is its own target; it never opens the Manage dialog. */}
-      <div
-        className="ml-auto flex h-9 shrink-0 items-center"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDown={(event) => event.stopPropagation()}
-      >
-        {action}
+      {/* The control is its own target; it never opens the Manage dialog.
+          Only the control swallows the click, so the space around it still
+          opens the tile. Key presses pass through: the tile ignores keys
+          that did not start on itself, and Escape must still reach a dialog
+          the control just opened. */}
+      <div className="ml-auto flex h-9 shrink-0 items-center">
+        <div
+          className="flex"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {action}
+        </div>
       </div>
     </div>
   );
   return (
-    <section aria-label={`${name} connector`} className="min-w-0">
-      <SettingsCard>
+    <section aria-label={`${name} ${kind}`} className="min-w-0">
+      <GlassCardUI>
         {onOpen ? (
           <div
-            className="cursor-pointer rounded-xl px-4 py-3 transition-colors hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="cursor-pointer rounded-xl px-4 py-3 transition-colors hover:bg-white/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
             role="button"
             tabIndex={0}
             aria-label={`Manage ${name}`}
@@ -72,7 +87,7 @@ export function ConnectorCard({
         ) : (
           <div className="px-4 py-3">{body}</div>
         )}
-      </SettingsCard>
+      </GlassCardUI>
     </section>
   );
 }

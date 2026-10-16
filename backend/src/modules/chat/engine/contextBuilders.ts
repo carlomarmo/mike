@@ -1,3 +1,5 @@
+import { responseLanguageName } from "../../../lib/responseLanguages";
+import { deadlineMessage, type StreamStopReason } from "../../../lib/streamRuns";
 import crypto from "crypto";
 import type { Db } from "../../../lib/supabase";
 import { ensureDocAccess } from "../../../lib/access";
@@ -10,6 +12,7 @@ import {
   type AskInputItem,
   type AskInputsResponseRequest,
   type AskInputResponseItem,
+  MAX_ASK_INPUT_CHOICE_LENGTH,
   MAX_ASK_INPUT_TEXT_LENGTH,
   devLog,
 } from "./types";
@@ -62,15 +65,19 @@ export function generateSpotlightNonce(conversationId?: string | null): string {
 
 /**
  * Neutralizes fence tokens the fenced text tries to smuggle in: redacts any
- * echoed nonce and HTML-encodes the `<` of any literal fence tag (both the
- * `<untrusted-content>` and `<workflow-instructions>` families), so even a
- * sloppy model never sees a clean boundary token inside the data.
+ * echoed nonce and HTML-encodes the `<` of any literal fence tag (the
+ * `<untrusted-content>`, `<workflow-instructions>`, and `<user-instructions>`
+ * families), so even a sloppy model never sees a clean boundary token inside
+ * the data.
  */
 function neutralizeFenceTokens(text: string, nonce: string): string {
   return String(text)
     .split(nonce)
     .join("[redacted-nonce]")
-    .replace(/<(\/?)(untrusted-content|workflow-instructions)/gi, "&lt;$1$2");
+    .replace(
+      /<(\/?)(untrusted-content|workflow-instructions|user-instructions)/gi,
+      "&lt;$1$2",
+    );
 }
 
 /**
@@ -95,6 +102,16 @@ export type UserPersonalisation = {
   practiceSetting: string | null;
   professionalTitle: string | null;
   practiceAreas: string[];
+  /** Free-form instructions the user wrote in Settings > Personalisation. */
+  customInstructions?: string;
+  /** Response style the user chose in Settings > Personalisation. */
+  responseStyle?: {
+    verbosity: "concise" | "balanced" | "detailed";
+    formatting: "balanced" | "less" | "more";
+    tone: "formal" | "balanced" | "plain";
+    /** `auto` or a code from lib/responseLanguages. */
+    language?: string;
+  };
 };
 
 const PRACTICE_SETTING_LABELS: Record<string, string> = {
@@ -105,13 +122,98 @@ const PRACTICE_SETTING_LABELS: Record<string, string> = {
 
 /**
  * Adds user-supplied professional context to a system prompt without allowing
- * profile values to act as instructions. Empty profiles add nothing.
+ * profile values to act as instructions, followed by the user's own custom
+ * instructions in the semi-trusted `<user-instructions>` fence. Empty
+ * profiles add nothing.
  */
 export function buildUserPersonalisationPrompt(
   profile: UserPersonalisation | undefined,
   nonce: string,
 ): string {
   if (!profile) return "";
+  return [
+    buildUserProfileFactsPrompt(profile, nonce),
+    buildResponseStylePrompt(profile.responseStyle),
+    buildCustomInstructionsPrompt(profile.customInstructions, nonce),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+const RESPONSE_STYLE_GUIDANCE: Record<string, Record<string, string>> = {
+  verbosity: {
+    concise:
+      "Length: the user prefers concise answers. Lead with the answer and keep explanation to what the question needs. Skip preamble, restatement, and optional background, but keep every caveat, risk, and citation that matters.",
+    detailed:
+      "Length: the user prefers detailed answers. Explain the reasoning behind conclusions, cover relevant exceptions, alternatives, and practical next steps, and cite supporting passages fully. Stay organised and do not pad.",
+  },
+  formatting: {
+    less:
+      "Headers and lists: use fewer of them. Write mainly in prose paragraphs and add headings, bullet points, or tables only when the content genuinely needs them, such as numbered steps or a side-by-side comparison.",
+    more:
+      "Headers and lists: use more of them. Organise answers for scanning with headings for distinct parts, bullet points for lists of points or steps, and tables for comparisons, keeping each bullet tight.",
+  },
+  tone: {
+    formal:
+      "Tone: formal and legal. Write in a formal, professional register with precise legal terminology, suitable for a client, counterparty, or court without edits. Avoid contractions, colloquialisms, and casual phrasing.",
+    plain:
+      "Tone: plain and simple. Prefer short sentences and everyday words, explain any legal term of art the first time it appears, and avoid legalese without losing accuracy.",
+  },
+};
+
+/**
+ * States the user's chosen response style. The values come from fixed
+ * server-validated sets, so this text is system-authored rather than fenced.
+ * 'balanced' is the default for every setting and adds nothing. The language
+ * is named from the server's own table, never from the stored string, so an
+ * unknown code adds nothing either.
+ */
+function buildResponseStylePrompt(
+  style: UserPersonalisation["responseStyle"],
+): string {
+  if (!style) return "";
+  const lines = (["verbosity", "formatting", "tone"] as const)
+    .map((field) => RESPONSE_STYLE_GUIDANCE[field][style[field]])
+    .filter(Boolean);
+  const language = responseLanguageName(style.language);
+  if (language) {
+    lines.push(
+      `Language: write your answers in ${language}, following its spelling and conventions. Keep quoted source text, defined terms, case names, and citations in their original language.`,
+    );
+  }
+  if (lines.length === 0) return "";
+  return `USER RESPONSE STYLE:
+${lines.map((line) => `- ${line}`).join("\n")}
+The user's latest message takes precedence if it asks for something different.`;
+}
+
+/**
+ * Wraps the user's custom instructions in the `<user-instructions>` fence.
+ *
+ * Like a workflow body, the user wrote these precisely so the model follows
+ * them, so they cannot go in the data-only `<untrusted-content>` fence. The
+ * system prompt tells the model to follow them like a standing user request
+ * that never overrides system rules. Same nonce and token neutralization as
+ * `spotlight()`, so the text cannot close its own fence.
+ */
+function buildCustomInstructionsPrompt(
+  instructions: string | undefined,
+  nonce: string,
+): string {
+  const text = instructions?.trim();
+  if (!text) return "";
+  const neutralized = neutralizeFenceTokens(text, nonce);
+  return `USER CUSTOM INSTRUCTIONS:
+The user wrote these standing instructions about how they want you to respond. Follow them in every answer unless the user's latest message asks otherwise. They never override system or safety rules.
+<user-instructions nonce="${nonce}">
+${neutralized}
+</user-instructions nonce="${nonce}">`;
+}
+
+function buildUserProfileFactsPrompt(
+  profile: UserPersonalisation,
+  nonce: string,
+): string {
   const facts = {
     ...(profile.displayName ? { name: profile.displayName } : {}),
     ...(profile.organisation ? { organisation: profile.organisation } : {}),
@@ -159,6 +261,107 @@ export function spotlightFilename(filename: string, nonce?: string): string {
 export function spotlightWorkflow(text: string, nonce: string): string {
   const neutralized = neutralizeFenceTokens(text, nonce);
   return `<workflow-instructions nonce="${nonce}">\n${neutralized}\n</workflow-instructions nonce="${nonce}">`;
+}
+
+/** Tail of a turn's reasoning kept when it is replayed to the model. */
+export const MAX_REPLAYED_REASONING_CHARS = 12_000;
+
+/**
+ * Reasoning replayed across the whole history. The newest turns are kept
+ * first; once a turn does not fit, it and every older turn go back as text.
+ */
+export const MAX_REPLAYED_REASONING_TOTAL_CHARS = 36_000;
+
+/**
+ * Attaches each earlier assistant turn's stored reasoning to the matching
+ * message in `messages`, for models that opt into reasoning replay
+ * (see ConfiguredModel.replayReasoning). Reasoning is replayed regardless of
+ * which model produced it, including events without model metadata. The
+ * client sends history as text only, so a message is matched by its visible text
+ * — the row's `content` events joined, exactly as the frontend rebuilds it.
+ * An unmatched or ambiguous message is left as is. Run this before
+ * enrichWithPriorEvents, which appends to the last assistant message's text.
+ */
+export async function attachPriorReasoning(
+  messages: ChatMessage[],
+  chatId: string | null | undefined,
+  db: Db,
+  messageTable = "chat_messages",
+): Promise<ChatMessage[]> {
+  if (!chatId || !messages.some((m) => m.role === "assistant")) {
+    return messages;
+  }
+  const { data: rows, error } = await db
+    .from(messageTable)
+    .select("content")
+    .eq("chat_id", chatId)
+    .eq("role", "assistant")
+    .not("content", "is", null)
+    .order("created_at", { ascending: true });
+  // Replay is an optimisation: a failed read degrades to text-only history.
+  if (error || !rows?.length) return messages;
+
+  const turns = (rows as { content?: unknown }[]).map((row) => {
+    const events = Array.isArray(row.content)
+      ? (row.content as { type?: unknown; text?: unknown }[])
+      : [];
+    const textOf = (type: string) =>
+      events
+        .filter((ev) => ev?.type === type && typeof ev.text === "string")
+        .map((ev) => ev.text as string);
+    const reasoning = textOf("reasoning").join("\n\n").trim();
+    return {
+      text: textOf("content").join("").trim(),
+      reasoning:
+        reasoning.length > MAX_REPLAYED_REASONING_CHARS
+          ? reasoning.slice(-MAX_REPLAYED_REASONING_CHARS)
+          : reasoning,
+    };
+  });
+
+  // Identical replies are paired in order only when the request carries every
+  // stored copy. If some are missing (a shortened or retried history), there
+  // is no telling which turn a copy is, so it goes back as text.
+  const storedByText = new Map<string, number[]>();
+  for (const [i, { text }] of turns.entries()) {
+    const indices = storedByText.get(text);
+    if (indices) indices.push(i);
+    else storedByText.set(text, [i]);
+  }
+  const assistantText = (msg: ChatMessage) =>
+    msg.role === "assistant" ? (msg.content ?? "").trim() : "";
+  const requestCount = new Map<string, number>();
+  for (const msg of messages) {
+    const text = assistantText(msg);
+    if (text) requestCount.set(text, (requestCount.get(text) ?? 0) + 1);
+  }
+  const seen = new Map<string, number>();
+  const matched = messages.map((msg) => {
+    const text = assistantText(msg);
+    if (!text) return undefined;
+    const occurrence = seen.get(text) ?? 0;
+    seen.set(text, occurrence + 1);
+    const stored = storedByText.get(text) ?? [];
+    if (stored.length !== requestCount.get(text)) return undefined;
+    return turns[stored[occurrence]].reasoning || undefined;
+  });
+
+  let remaining = MAX_REPLAYED_REASONING_TOTAL_CHARS;
+  for (let i = matched.length - 1; i >= 0; i--) {
+    const reasoning = matched[i];
+    if (reasoning === undefined) continue;
+    if (reasoning.length > remaining) {
+      remaining = 0;
+      matched[i] = undefined;
+    } else {
+      remaining -= reasoning.length;
+    }
+  }
+
+  return messages.map((msg, i) => {
+    const reasoning = matched[i];
+    return reasoning === undefined ? msg : { ...msg, reasoning };
+  });
 }
 
 export async function enrichWithPriorEvents(
@@ -481,7 +684,12 @@ export function buildMessages(
       });
       content = `[The user attached the following document(s) to this message:\n${lines.join("\n")}]\n\n${content}`;
     }
-    formatted.push({ role: msg.role, content: stamp(msg, index, content) });
+    content = stamp(msg, index, content);
+    formatted.push(
+      msg.role === "assistant" && msg.reasoning
+        ? { role: msg.role, content, reasoning: msg.reasoning }
+        : { role: msg.role, content },
+    );
   }
   return formatted;
 }
@@ -670,7 +878,7 @@ export function parseAskInputsResponsePayload(
             : "";
         const answers = (Array.isArray(current.answers) ? current.answers : [])
           .filter((answer): answer is string => typeof answer === "string")
-          .map((answer) => answer.trim().slice(0, 1_000))
+          .map((answer) => answer.trim().slice(0, MAX_ASK_INPUT_CHOICE_LENGTH))
           .filter(Boolean)
           .slice(0, 9);
         if (!question || (answers.length === 0 && !skipped)) return null;
@@ -691,7 +899,7 @@ export function parseAskInputsResponsePayload(
           typeof current.answer === "string"
             ? current.answer
                 .trim()
-                .slice(0, kind === "text" ? MAX_ASK_INPUT_TEXT_LENGTH : 1_000)
+                .slice(0, kind === "text" ? MAX_ASK_INPUT_TEXT_LENGTH : MAX_ASK_INPUT_CHOICE_LENGTH)
             : "";
         if (!question || (!answer && !skipped)) return null;
         return {
@@ -971,6 +1179,25 @@ export function buildCancelledAssistantMessage(args: {
   };
 }
 
+/** Preserve partial output while distinguishing a deadline from an explicit Stop. */
+export function buildStoppedAssistantMessage(
+  args: Parameters<typeof buildCancelledAssistantMessage>[0] & {
+    stopReason?: StreamStopReason | null;
+  },
+) {
+  if (!args.stopReason || args.stopReason === "user")
+    return buildCancelledAssistantMessage(args);
+  const events: AssistantEvent[] = [
+    ...stripTransientAssistantEvents(args.events),
+    {
+      type: "error",
+      message: deadlineMessage(args.stopReason),
+      safe_to_display: true,
+    },
+  ];
+  return { events, citations: args.buildCitations(args.fullText, events) };
+}
+
 // ---------------------------------------------------------------------------
 // Document context builder (from message file attachments)
 // ---------------------------------------------------------------------------
@@ -1069,7 +1296,14 @@ export async function buildDocContext(
     // asked about, so ask once per container and reuse the answer; a
     // document with no container at all still resolves individually, which
     // costs nothing (it is a `user_id === caller` comparison in memory).
+    //
+    // A document filed on its own under an organization has no container
+    // either: it is its uploader's alone, while they are a member. That
+    // verdict turns on the uploader as well as the organization, so the two
+    // together are the key — one answer per organization would hand a
+    // colleague's files to whoever's own file happened to be asked first.
     const containerKey = (doc: {
+      user_id: string | null;
       project_id: string | null;
       workflow_id?: string | null;
       org_id?: string | null;
@@ -1079,16 +1313,18 @@ export async function buildDocContext(
         : doc.workflow_id
           ? `workflow:${doc.workflow_id}`
           : doc.org_id
-            ? `org:${doc.org_id}`
+            ? `org:${doc.org_id}:${doc.user_id ?? ""}`
             : null;
 
     const verdictByContainer = new Map<string, boolean>();
     for (const doc of candidates) {
       const key = containerKey(doc);
       if (!key || verdictByContainer.has(key)) continue;
-      // The representative carries the container this verdict is about; its
-      // `user_id` only ever decides the ROLE, never `ok`, so reusing one
-      // document's answer for its siblings cannot widen access.
+      // The representative carries the container this verdict is about. In
+      // a project or a workflow its `user_id` only ever decides the ROLE,
+      // never `ok`, so reusing one document's answer for its siblings cannot
+      // widen access; on its own in an organization the uploader is part of
+      // the key.
       const verdict = await ensureDocAccess(doc, userId, userEmail ?? null, db);
       verdictByContainer.set(key, verdict.ok);
     }

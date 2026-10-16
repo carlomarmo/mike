@@ -11,7 +11,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Pencil, Trash2 } from "lucide-react";
-import { MikeIcon } from "@/app/components/chat/mike-icon";
+import { MikeIcon } from "@/shared/ui/MikeIconUI";
 import {
     streamTabularChat,
     streamTabularChatTurn,
@@ -2028,6 +2028,9 @@ export function TRChatPanel({
                         currentChatId ? (
                             <HeaderActionsMenu
                                 triggerClassName="h-6 w-6"
+                                // One header menu at a time: opening the
+                                // chat history closes this, and the reverse.
+                                modal={false}
                                 onCloseAutoFocus={(event) => {
                                     if (titleDraft !== null)
                                         event.preventDefault();

@@ -294,6 +294,17 @@ export async function runToolCalls(
      * Without it, a connector write that needs approval is refused.
      */
     connectorApprovals?: boolean;
+    /**
+     * The caller's authenticated email, for the per-document write check
+     * edit_document runs (direct grants are keyed by email).
+     */
+    userEmail?: string | null;
+    /**
+     * The organization the conversation belongs to, if any. A document the
+     * assistant creates outside a project is filed under it, so that work
+     * done in an organization's workspace stays in that organization.
+     */
+    orgId?: string | null;
   } = {},
 ): Promise<{
   toolResults: unknown[];
@@ -535,6 +546,7 @@ export async function runToolCalls(
           name: tc.function.name,
           connector_name: event.connector_name,
           tool_name: event.tool_name,
+          tool_title: event.tool_title,
           status: event.status,
           error: event.error,
         })}\n\n`,
@@ -1504,6 +1516,7 @@ export async function runToolCalls(
         const result = await runEditDocument({
           documentId: indexed.document_id,
           userId,
+          userEmail: options.userEmail ?? null,
           edits,
           db,
           reuseVersion,
@@ -1747,6 +1760,9 @@ export async function runToolCalls(
             const docRows = newDocs.map((d) => ({
               id: d.id,
               project_id: projectId ?? null,
+              // Outside a project: the conversation's organization. Inside
+              // one the database stamps the project's.
+              org_id: options.orgId ?? null,
               user_id: userId,
               status: "ready",
               library_kind: "file",
@@ -1781,6 +1797,7 @@ export async function runToolCalls(
                 // it must not see a size that disagrees with content_sha256.
                 size_bytes: raw.byteLength,
                 page_count: active?.page_count ?? null,
+                textless_page_count: active?.textless_page_count ?? null,
                 content_sha256: contentSha256(raw),
               }));
               const { data: insertedVersions, error: verErr } = await createDocumentVersions(db, versionRows);
@@ -1955,7 +1972,12 @@ export async function runToolCalls(
         args.sections as unknown[],
         userId,
         db,
-        { landscape, numberSections, projectId: projectId ?? null },
+        {
+          landscape,
+          numberSections,
+          projectId: projectId ?? null,
+          orgId: options.orgId ?? null,
+        },
       );
       registerGeneratedDocument(
         tc,
@@ -1975,7 +1997,7 @@ export async function runToolCalls(
         args.sheets as unknown[],
         userId,
         db,
-        { projectId: projectId ?? null },
+        { projectId: projectId ?? null, orgId: options.orgId ?? null },
       );
       registerGeneratedDocument(
         tc,
@@ -1995,7 +2017,7 @@ export async function runToolCalls(
         args.slides as unknown[],
         userId,
         db,
-        { projectId: projectId ?? null },
+        { projectId: projectId ?? null, orgId: options.orgId ?? null },
       );
       registerGeneratedDocument(
         tc,

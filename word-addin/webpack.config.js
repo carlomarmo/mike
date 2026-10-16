@@ -168,7 +168,9 @@ module.exports = async (_env, options) => {
     },
     resolve: {
       extensions: [".ts", ".tsx", ".js", ".jsx"],
-      modules: [path.resolve(__dirname, "node_modules"), "node_modules"],
+      // Resolve each package's nested dependencies before the add-in fallback.
+      // Sentry's build plugin and runtime SDK can require different versions.
+      modules: ["node_modules", path.resolve(__dirname, "node_modules")],
       alias: {
         // Cross-app source files must use the add-in's React runtime so the
         // bundle never picks up a second copy from frontend/node_modules.
@@ -193,6 +195,7 @@ module.exports = async (_env, options) => {
         "@mike/document-event-blocks-ui": frontendSharedUi(
           "DocumentEventBlocksUI.tsx",
         ),
+        "@mike/input-ui": frontendSharedUi("InputUI.tsx"),
         "@mike/glass-card-ui": frontendSharedUi("GlassCardUI.tsx"),
         "@mike/modal-ui": frontendSharedUi("ModalUI.tsx"),
         "@mike/header-buttons-ui": frontendSharedUi(
@@ -203,7 +206,7 @@ module.exports = async (_env, options) => {
           "TabPillButtonUI.tsx",
         ),
         "@mike/toggle-switch-ui": frontendSharedUi("ToggleSwitchUI.tsx"),
-        "@mike/dropdown-ui": frontendSharedUi("DropdownUI.tsx"),
+        "@mike/dropdown-ui": frontendSharedUi("dropdown.tsx"),
         "@mike/citation-pill-ui": frontendSharedUi("CitationPillUI.tsx"),
         "@mike/model-toggle-ui": frontendSharedUi("ModelToggleUI.tsx"),
         "@mike/mike-icon-ui": frontendSharedUi("MikeIconUI.tsx"),
@@ -223,6 +226,28 @@ module.exports = async (_env, options) => {
         // Sentry event hygiene (PII scrub + console-bridge dedupe) is one
         // policy for the web app and the add-in.
         "@mike/sentry-event": frontendShared("lib", "sentryEvent.ts"),
+        // Error presentation: one classifier and one toast stack for both
+        // clients, so a failure reads the same in Word as it does on the web.
+        "@mike/toast-store": frontendShared("lib", "toastStore.ts"),
+        "@mike/toast-ui": frontendSharedUi("ToastUI.tsx"),
+        "@mike/user-error": frontendShared("lib", "userError.ts"),
+        // One model catalog (routers, picker rows, key-based availability)
+        // for the web app and the add-in.
+        "@mike/model-catalog": frontendShared("lib", "modelCatalog.ts"),
+        // Quoting and annotating a passage of a response: one wire format,
+        // menu, pill and modal for the web app and the add-in.
+        "@mike/message-excerpts": frontendShared("lib", "messageExcerpts.ts"),
+        "@mike/response-selection-menu-ui": frontendSharedUi(
+          "ResponseSelectionMenuUI.tsx",
+        ),
+        "@mike/excerpt-pill-ui": frontendSharedUi("ExcerptPillUI.tsx"),
+        "@mike/excerpt-modal-ui": frontendSharedUi("ExcerptModalUI.tsx"),
+        "@mike/chat-history-dropdown-ui": frontendSharedUi(
+          "ChatHistoryDropdownUI.tsx",
+        ),
+        "@mike/composer-send-button-ui": frontendSharedUi(
+          "ComposerSendButtonUI.styles.ts",
+        ),
       },
     },
     module: {

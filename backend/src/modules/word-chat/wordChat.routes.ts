@@ -5,6 +5,7 @@ import {
   getAssistantTurnRun,
   startAssistantTurnRun,
 } from "../../lib/assistantTurnRuns";
+import { stopOutcomeFrame } from "../../lib/streamRuns";
 // HTTP layer for the word-chat module — the Word task pane's chat surface.
 //
 // Route handlers parse params/query/body, call the wordChat.service functions,
@@ -22,8 +23,7 @@ import { createServerSupabase } from "../../lib/supabase";
 import {
   AssistantStreamError,
   assistantStreamErrorPayload,
-  ASSISTANT_ERROR_MESSAGE,
-  buildCancelledAssistantMessage,
+  buildStoppedAssistantMessage,
   extractCitations,
   isAbortError,
   parseChatMessages,
@@ -821,10 +821,12 @@ wordChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
       })}\n\n`,
     );
     const { events, citations } = await runLLMStream({
+      onActivity: run?.touch,
       apiMessages,
       docStore,
       docIndex,
       userId,
+      userEmail,
       db,
       write,
       workflowStore,
@@ -938,12 +940,13 @@ wordChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
           surface: "word",
           title: chatTitle ?? activeDocumentName ?? null,
           model: selectedModel,
-          status: "cancelled",
+          status: run?.stopReason && run.stopReason !== "user" ? "failed" : "cancelled",
         },
         null,
       );
       if (error instanceof AssistantStreamError) {
-        const partial = buildCancelledAssistantMessage({
+        const partial = buildStoppedAssistantMessage({
+          stopReason: run?.stopReason,
           fullText: error.fullText,
           events: error.events,
           buildCitations: (fullText) =>
@@ -961,7 +964,7 @@ wordChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
       await updateChatActivity();
       // Readers still attached (Stop came from another pane, or this one is
       // only watching) learn the outcome the way a reopen would.
-      write(`data: ${JSON.stringify({ type: "cancelled" })}\n\n`);
+      write(stopOutcomeFrame(run));
       write("data: [DONE]\n\n");
       return;
     }

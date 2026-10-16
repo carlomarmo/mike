@@ -12,24 +12,38 @@ import {
     uploadStandaloneDocuments,
 } from "@/app/lib/mikeApi";
 import type { AccessAssignmentRole } from "@/app/lib/mikeApi";
+import {
+    useDocumentWorkspace,
+    useWorkspace,
+    useWorkspaceOrgId,
+} from "@/app/contexts/WorkspaceContext";
 import { userFacingApiError } from "@/app/lib/userFacingError";
+import {
+    SUPPORTED_DOCUMENT_ACCEPT,
+    combineUploadWarnings,
+    formatUnsupportedDocumentWarning,
+    partitionSupportedDocumentFiles,
+} from "@/app/lib/documentUploadValidation";
 import { FileDirectory } from "../shared/FileDirectory";
 import { Modal } from "../modals/Modal";
 import { ModalSelect } from "../modals/ModalSelect";
 import { FieldLabel, FormTextInput } from "../ui/form-field";
 import { ToggleSwitchUI } from "@/shared/ui/ToggleSwitchUI";
+import { ModelToggle } from "../assistant/ModelToggle";
 import {
-    ModelToggle,
+    isRouterModelSelected,
     type NoModelsReason,
-    type RouterSlug,
-} from "../assistant/ModelToggle";
+} from "@/shared/lib/modelCatalog";
 import { useUserProfile } from "@/app/contexts/UserProfileContext";
+import { useModelApiKeys } from "@/app/hooks/useModelApiKeys";
+import { useModelRouterSelections } from "@/app/hooks/useModelRouterSelections";
 import { isModelAvailable } from "@/app/lib/modelAvailability";
 import { NoModelsWarningPopup } from "../popups/NoModelsWarningPopup";
 import { useAuth } from "@/app/contexts/AuthContext";
 import {
     CreateAccessStep,
     type PendingDirectGrant,
+    type PendingOrgOverride,
 } from "../modals/CreateAccessStep";
 import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
@@ -66,6 +80,7 @@ interface Props {
     projectCmNumber?: string | null;
 }
 
+/** Collects tabular-review configuration and pending access choices before creating a review. */
 export function NewTRModal({
     open,
     onClose,
@@ -77,6 +92,9 @@ export function NewTRModal({
     projectName,
     projectCmNumber,
 }: Props) {
+    // A document uploaded on its own belongs to the workspace it is
+    // uploaded in.
+    const workspace = useDocumentWorkspace();
     const isProjectMode = projectId !== undefined;
     const [step, setStep] = useState<"details" | "access" | "documents">(
         "details",
@@ -85,13 +103,20 @@ export function NewTRModal({
     const [underProject, setUnderProject] = useState(false);
     const [selectedProjectId, setSelectedProjectId] = useState("");
     const [directGrants, setDirectGrants] = useState<PendingDirectGrant[]>([]);
+    // In an organization's workspace a review started on its own belongs to
+    // that organization and is shared with its members only: they are picked
+    // from the roster here, and given access by address once it exists. The
+    // id is the one the review is created under, so the two cannot disagree.
+    const { activeOrganization } = useWorkspace();
+    const workspaceOrgId = useWorkspaceOrgId() ?? null;
+    const [memberGrants, setMemberGrants] = useState<PendingOrgOverride[]>([]);
     const [selectedModel, setSelectedModel] = useState("");
     const [noModelsWarning, setNoModelsWarning] =
         useState<NoModelsReason | null>(null);
-    const { profile, loading: profileLoading, apiKeysDegraded } =
-        useUserProfile();
+    const { profile, loading: profileLoading } = useUserProfile();
     const { user } = useAuth();
-    const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
+    const apiKeys = useModelApiKeys();
+    const modelRouterSelections = useModelRouterSelections();
     const configuredModels = useConfiguredModels();
     const configuredModelIds = useMemo(
         () => configuredModels.map((model) => model.id),
@@ -180,26 +205,17 @@ export function NewTRModal({
     useEffect(() => {
         if (!open || !profile?.tabularModel) return;
         const defaultModel = profile.tabularModel;
-        const router = (["openrouter", "vercel", "opencode-go"] as const).find(
-            (slug) => defaultModel.startsWith(`${slug}/`),
-        );
-        const selectedByRouter: Record<RouterSlug, string[]> = {
-            openrouter: profile.openRouterModels,
-            vercel: profile.vercelModels,
-            "opencode-go": profile.openCodeGoModels,
-        };
+        // Unknown lists (an organization's, still loading) preselect nothing.
         const routerSelectionValid =
-            !router ||
-            selectedByRouter[router].includes(
-                defaultModel.slice(router.length + 1),
-            );
+            !!modelRouterSelections &&
+            isRouterModelSelected(defaultModel, modelRouterSelections);
         const providerAvailable =
             !apiKeys ||
             isModelAvailable(defaultModel, apiKeys, configuredModelIds);
         if (routerSelectionValid && providerAvailable) {
             setSelectedModel((current) => current || defaultModel);
         }
-    }, [apiKeys, configuredModelIds, open, profile]);
+    }, [apiKeys, configuredModelIds, modelRouterSelections, open, profile]);
 
     // Preselect every project document once, as soon as they're available —
     // which may be after the modal opened, since the parent's list is empty
@@ -231,6 +247,7 @@ export function NewTRModal({
         setUnderProject(false);
         setSelectedProjectId("");
         setDirectGrants([]);
+        setMemberGrants([]);
         setSelectedModel("");
         setNoModelsWarning(null);
         setProjectDocs([]);
@@ -274,7 +291,21 @@ export function NewTRModal({
             : underProject
               ? selectedProjectId
               : undefined;
-        const assignments = effectiveProjectId ? [] : directGrants;
+        const assignments: PendingDirectGrant[] = effectiveProjectId
+            ? []
+            : workspaceOrgId
+              ? memberGrants.flatMap((grant) =>
+                    grant.role === "deny"
+                        ? []
+                        : [
+                              {
+                                  email: grant.email,
+                                  display_name: null,
+                                  role: grant.role,
+                              },
+                          ],
+                )
+              : directGrants;
         try {
             const partialFailure = await onAdd(
                 title.trim(),
@@ -315,6 +346,7 @@ export function NewTRModal({
         try {
             const proj = await getProject(projectId);
             setDirectGrants([]);
+            setMemberGrants([]);
             const docs = (proj.documents ?? []).filter(
                 (d) => d.status === "ready",
             );
@@ -329,8 +361,19 @@ export function NewTRModal({
     async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const files = Array.from(e.target.files ?? []);
         if (!files.length) return;
+        // `accept` is a hint the OS picker can be talked out of, so the file
+        // types the converter cannot read are filtered here too, and named,
+        // rather than spending an upload session on a guaranteed rejection.
+        const { supported, unsupported } =
+            partitionSupportedDocumentFiles(files);
+        const unsupportedWarning =
+            formatUnsupportedDocumentWarning(unsupported);
+        setUploadError(unsupportedWarning);
+        if (supported.length === 0) {
+            if (fileInputRef.current) fileInputRef.current.value = "";
+            return;
+        }
         setUploading(true);
-        setUploadError(null);
         try {
             const uploadProjectId = isProjectMode
                 ? projectId
@@ -340,10 +383,12 @@ export function NewTRModal({
             const outcomes = uploadProjectId
                 ? await uploadProjectDocuments(
                       uploadProjectId,
-                      files.map((file) => ({ file })),
+                      supported.map((file) => ({ file })),
                   )
                 : await uploadStandaloneDocuments(
-                      files.map((file) => ({ file })),
+                      supported.map((file) => ({ file })),
+                      undefined,
+                      workspace,
                   );
             const uploaded = outcomes.flatMap((outcome) =>
                 outcome.status === "completed" && outcome.result
@@ -366,17 +411,25 @@ export function NewTRModal({
             // review, so say which ones instead of leaving the picker looking
             // as though the upload simply produced nothing.
             if (uploaded.length < outcomes.length) {
-                setUploadError(failedUploadMessage(outcomes));
+                setUploadError(
+                    combineUploadWarnings(
+                        unsupportedWarning,
+                        failedUploadMessage(outcomes),
+                    ),
+                );
             }
         } catch (err) {
             console.error("Upload failed:", err);
             setUploadError(
-                err instanceof UploadBatchError
-                    ? failedUploadMessage(err.outcomes)
-                    : userFacingApiError(
-                          err,
-                          "The selected files could not be uploaded. Please try again.",
-                      ),
+                combineUploadWarnings(
+                    unsupportedWarning,
+                    err instanceof UploadBatchError
+                        ? failedUploadMessage(err.outcomes)
+                        : userFacingApiError(
+                              err,
+                              "The selected files could not be uploaded. Please try again.",
+                          ),
+                ),
             );
         } finally {
             setUploading(false);
@@ -487,6 +540,7 @@ export function NewTRModal({
                             type: "button",
                             onClick: () => {
                                 setDirectGrants([]);
+                                setMemberGrants([]);
                                 setStep("documents");
                             },
                             disabled: uploading,
@@ -534,7 +588,7 @@ export function NewTRModal({
             <input
                 ref={fileInputRef}
                 type="file"
-                accept=".pdf,.docx,.doc,.xlsx,.xlsm,.xls,.pptx,.ppt"
+                accept={SUPPORTED_DOCUMENT_ACCEPT}
                 multiple
                 className="hidden"
                 onChange={handleUpload}
@@ -569,9 +623,7 @@ export function NewTRModal({
                                 onChange={setSelectedModel}
                                 apiKeys={apiKeys}
                                 apiKeysLoading={profileLoading && !profile}
-                                openRouterModels={profile?.openRouterModels}
-                                vercelModels={profile?.vercelModels}
-                                openCodeGoModels={profile?.openCodeGoModels}
+                                routerSelections={modelRouterSelections}
                                 onNoModelsClick={setNoModelsWarning}
                                 modalInput
                             />
@@ -640,13 +692,25 @@ export function NewTRModal({
                     </div>
                 ) : step === "access" ? (
                     <CreateAccessStep
-                        orgId={null}
+                        orgId={workspaceOrgId}
+                        organizationName={activeOrganization?.name ?? null}
                         currentUserEmail={user?.email ?? null}
+                        currentUserProfile={profile}
                         currentUserId={user?.id ?? null}
                         directGrants={directGrants}
                         onDirectGrantsChange={setDirectGrants}
+                        orgOverrides={memberGrants}
+                        onOrgOverridesChange={setMemberGrants}
                         inheritedFromProject={isProjectMode || underProject}
+                        inheritedProjectId={
+                            isProjectMode
+                                ? projectId
+                                : underProject
+                                  ? selectedProjectId || null
+                                  : null
+                        }
                         ownerLabel="Review owners"
+                        resourceNoun="review"
                     />
                 ) : (
                     <div className="flex min-h-0 flex-1 flex-col">

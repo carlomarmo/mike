@@ -1,5 +1,8 @@
 "use client";
 
+import { RowActionMenuItems } from "@/app/components/shared/RowActions";
+import { rowActionSelectionIds } from "@/app/components/shared/TablePrimitive";
+import { SelectionActionsMenu } from "@/app/components/shared/SelectionActionsMenu";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -7,7 +10,6 @@ import {
     Loader2,
     Square,
     Play,
-    ChevronDown,
     MessageSquare,
     MessageSquareX,
     Download,
@@ -68,6 +70,8 @@ import {
     type OwnerGate,
 } from "@/app/components/projects/ProjectWorkspace";
 import { useUserProfile } from "@/app/contexts/UserProfileContext";
+import { useModelApiKeys } from "@/app/hooks/useModelApiKeys";
+import { useModelRouterSelections } from "@/app/hooks/useModelRouterSelections";
 import {
     getModelProvider,
     isModelAvailable,
@@ -82,13 +86,20 @@ import { TabularReviewDetailsModal } from "./TabularReviewDetailsModal";
 import { exportTabularReviewToExcel } from "./exportToExcel";
 import { readSseFrames } from "@/app/lib/sse";
 import { useSidebar } from "@/app/contexts/SidebarContext";
+import {
+    DocumentWorkspaceScope,
+    PERSONAL_WORKSPACE,
+} from "@/app/contexts/WorkspaceContext";
 import { PageHeader } from "../shared/PageHeader";
 import { TableToolbar } from "../shared/TableToolbar";
 import { TabPillButtonUI } from "@/shared/ui/TabPillButtonUI";
-import { LIQUID_GLASS_FLOAT_CLASS } from "@/shared/ui/LiquidGlassUI";
-import { ModelToggle, type NoModelsReason } from "../assistant/ModelToggle";
+import { ModelToggle } from "../assistant/ModelToggle";
+import {
+    type NoModelsReason,
+} from "@/shared/lib/modelCatalog";
 import { SUPPORTED_DOCUMENT_ACCEPT } from "@/app/lib/documentUploadValidation";
 import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
+import { useItemWorkspace } from "@/app/hooks/useItemWorkspace";
 
 interface Props {
     reviewId: string;
@@ -103,6 +114,12 @@ export function TRView({ reviewId, projectId }: Props) {
     );
     const { setSidebarOpen } = useSidebar();
     const [review, setReview] = useState<TabularReview | null>(null);
+    // Opening a review opens its workspace. One in a project follows its
+    // project, which says so itself.
+    useItemWorkspace(
+        projectId ? null : review?.id,
+        review ? (review.org_id ?? null) : undefined,
+    );
     const [project, setProject] = useState<Project | null>(null);
     const [cells, setCells] = useState<TabularCell[]>([]);
     const [documents, setDocuments] = useState<Document[]>([]);
@@ -123,6 +140,12 @@ export function TRView({ reviewId, projectId }: Props) {
     const [availableProjects, setAvailableProjects] = useState<Project[]>([]);
     const [accessModalOpen, setAccessModalOpen] = useState(false);
     const [grants, setGrants] = useState<ContentAccessGrant[] | null>(null);
+    // The organization whose members a standalone review can be shared with,
+    // as the server says: null for a personal review, which can go to any
+    // Mike user. Undefined until the access summary has loaded.
+    const [accessOrgId, setAccessOrgId] = useState<string | null | undefined>(
+        undefined,
+    );
     const [workflowModalOpen, setWorkflowModalOpen] = useState(false);
     const [applyingWorkflow, setApplyingWorkflow] = useState(false);
     const [deleteReviewConfirmOpen, setDeleteReviewConfirmOpen] =
@@ -156,6 +179,7 @@ export function TRView({ reviewId, projectId }: Props) {
     const [uploadingDroppedFilenames, setUploadingDroppedFilenames] = useState<
         string[]
     >([]);
+    const [generationError, setGenerationError] = useState<string | null>(null);
     const [dropUploadWarning, setDropUploadWarning] = useState<string | null>(
         null,
     );
@@ -179,7 +203,6 @@ export function TRView({ reviewId, projectId }: Props) {
     const [noModelsWarning, setNoModelsWarning] =
         useState<NoModelsReason | null>(null);
     const [modelRequiredWarning, setModelRequiredWarning] = useState(false);
-    const actionsRef = useRef<HTMLDivElement>(null);
     const tableRef = useRef<TRTableHandle>(null);
     const reviewFileUploadInputRef = useRef<HTMLInputElement>(null);
     const reviewFolderUploadInputRef = useRef<HTMLInputElement>(null);
@@ -200,14 +223,11 @@ export function TRView({ reviewId, projectId }: Props) {
         [],
     );
     const router = useRouter();
-    const {
-        profile,
-        loading: profileLoading,
-        apiKeysDegraded,
-    } = useUserProfile();
+    const { profile, loading: profileLoading } = useUserProfile();
     // Unknown key state fails open; the submit gates below already skip when
     // apiKeys is undefined.
-    const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
+    const apiKeys = useModelApiKeys();
+    const modelRouterSelections = useModelRouterSelections();
     const tabularModel = review?.model ?? "";
     const cellMutationsBlocked =
         generating || stoppingGeneration || review?.is_running === true;
@@ -224,19 +244,6 @@ export function TRView({ reviewId, projectId }: Props) {
         window.history.replaceState(null, "", newUrl);
     }, [chatOpen, selectedChatId]);
 
-    useEffect(() => {
-        if (!actionsOpen) return;
-        function handleClickOutside(e: MouseEvent) {
-            if (
-                actionsRef.current &&
-                !actionsRef.current.contains(e.target as Node)
-            )
-                setActionsOpen(false);
-        }
-        document.addEventListener("mousedown", handleClickOutside);
-        return () =>
-            document.removeEventListener("mousedown", handleClickOutside);
-    }, [actionsOpen]);
 
     useEffect(() => {
         // Cancellation flag: on a rapid reviewId change the previous fetch
@@ -336,6 +343,7 @@ export function TRView({ reviewId, projectId }: Props) {
         try {
             const access = await getTabularReviewAccess(reviewId);
             setGrants(access.grants);
+            setAccessOrgId(access.org_id ?? null);
         } catch (error) {
             console.error("[tabular review] failed to load access", error);
             setGrants([]);
@@ -344,6 +352,7 @@ export function TRView({ reviewId, projectId }: Props) {
 
     useEffect(() => {
         setGrants(null);
+        setAccessOrgId(undefined);
     }, [reviewId]);
 
     useEffect(() => {
@@ -461,6 +470,9 @@ export function TRView({ reviewId, projectId }: Props) {
             for (const file of files) {
                 const document = await uploadReviewDocument(reviewId, file, {
                     projectId,
+                    workspace: review
+                        ? (review.org_id ?? PERSONAL_WORKSPACE)
+                        : undefined,
                     documentIds,
                     columnsConfig: columns,
                 });
@@ -613,16 +625,23 @@ export function TRView({ reviewId, projectId }: Props) {
                                 : c,
                         ),
                     );
-                } else if (
-                    data.type === "error" &&
-                    data.code === "invalid_api_key"
-                ) {
-                    setApiKeyWarning({
-                        kind: "rejected",
-                        provider: tabularModel
-                            ? getModelProvider(tabularModel)
-                            : null,
-                    });
+                } else if (data.type === "error") {
+                    if (data.code === "invalid_api_key") {
+                        setApiKeyWarning({
+                            kind: "rejected",
+                            provider: tabularModel
+                                ? getModelProvider(tabularModel)
+                                : null,
+                        });
+                    } else {
+                        setGenerationError(
+                            data.safe_to_display === true &&
+                            typeof data.message === "string" &&
+                            data.message.trim()
+                                ? data.message.trim()
+                                : "The review could not be completed. Please try again.",
+                        );
+                    }
                 }
             } catch (err) {
                 console.warn(
@@ -726,6 +745,7 @@ export function TRView({ reviewId, projectId }: Props) {
             return;
         }
 
+        setGenerationError(null);
         const generationAbort = new AbortController();
         generationAbortRef.current = generationAbort;
         // A new run numbers its frames from 1, so a reconnect must not ask to
@@ -756,7 +776,7 @@ export function TRView({ reviewId, projectId }: Props) {
                 }
                 const provider =
                     payload &&
-                    ["claude", "gemini", "openai"].includes(payload.provider)
+                    ["claude", "gemini", "openai", "mistral"].includes(payload.provider)
                         ? (payload.provider as ModelProvider)
                         : getModelProvider(tabularModel);
                 if (payload?.code === "missing_api_key" && provider) {
@@ -1032,11 +1052,11 @@ export function TRView({ reviewId, projectId }: Props) {
         setExpandedDocumentId(document.id);
     }
 
-    async function handleDeleteDocuments() {
+    async function handleDeleteDocuments(targetIds: string[] = selectedRowIds) {
         // Removing documents deletes their cells — member tier, like every
         // other reshaping of the review.
         if (!requireStructure("remove documents from this review")) return;
-        const rowIdsToDelete = [...selectedRowIds];
+        const rowIdsToDelete = [...targetIds];
         if (rowIdsToDelete.length === 0) return;
         const documentIdsToDelete = new Set(
             rows
@@ -1110,9 +1130,20 @@ export function TRView({ reviewId, projectId }: Props) {
         }
     }
 
-    async function handleClearResults() {
+    async function handleClearResults(targetIds: string[] = selectedRowIds) {
         if (!requireStructure("clear results")) return;
-        await clearResultsForRows([...selectedRowIds]);
+        await clearResultsForRows([...targetIds]);
+    }
+
+    function renderReviewRowActions(ids: string[], close?: () => void) {
+        return (
+            <RowActionMenuItems
+                onClose={close}
+                onClearResults={() => void handleClearResults(ids)}
+                clearResultsDisabled={cellMutationsBlocked}
+                onDelete={() => void handleDeleteDocuments(ids)}
+            />
+        );
     }
 
     async function handleClearAllResults() {
@@ -1501,12 +1532,8 @@ export function TRView({ reviewId, projectId }: Props) {
                                             apiKeysLoading={
                                                 profileLoading && !profile
                                             }
-                                            openRouterModels={
-                                                profile?.openRouterModels
-                                            }
-                                            vercelModels={profile?.vercelModels}
-                                            openCodeGoModels={
-                                                profile?.openCodeGoModels
+                                            routerSelections={
+                                                modelRouterSelections
                                             }
                                             onNoModelsClick={setNoModelsWarning}
                                         />
@@ -1594,63 +1621,11 @@ export function TRView({ reviewId, projectId }: Props) {
                                         <div className="h-3 w-24 rounded bg-gray-100 animate-pulse" />
                                     ) : null}
                                     {!loading && selectedRowIds.length > 0 && (
-                                        <>
-                                            {/* Desktop: compact Actions menu */}
-                                            <div
-                                                ref={actionsRef}
-                                                className="relative max-md:hidden"
-                                            >
-                                                <TabPillButtonUI
-                                                    onClick={() =>
-                                                        setActionsOpen(
-                                                            (v) => !v,
-                                                        )
-                                                    }
-                                                >
-                                                    Actions
-                                                    <ChevronDown className="h-3.5 w-3.5" />
-                                                </TabPillButtonUI>
-                                                {actionsOpen && (
-                                                    <div
-                                                        className={`absolute right-0 top-full z-50 mt-1 w-36 overflow-hidden rounded-lg ${LIQUID_GLASS_FLOAT_CLASS} backdrop-blur-2xl`}
-                                                    >
-                                                        <button
-                                                            onClick={
-                                                                handleClearResults
-                                                            }
-                                                            disabled={
-                                                                cellMutationsBlocked
-                                                            }
-                                                            className="theme-dropdown-item w-full px-3 py-1.5 text-left text-xs text-gray-700 transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-                                                        >
-                                                            Clear results
-                                                        </button>
-                                                        <button
-                                                            onClick={
-                                                                handleDeleteDocuments
-                                                            }
-                                                            className="w-full px-3 py-1.5 text-left text-xs text-red-600 hover:bg-red-50 transition-colors"
-                                                        >
-                                                            Delete
-                                                        </button>
-                                                    </div>
-                                                )}
-                                            </div>
-                                            {/* Mobile (toolbar dropdown): flattened entries */}
-                                            <TabPillButtonUI
-                                                onClick={handleClearResults}
-                                                disabled={cellMutationsBlocked}
-                                                className="md:hidden"
-                                            >
-                                                Clear results
-                                            </TabPillButtonUI>
-                                            <TabPillButtonUI
-                                                onClick={handleDeleteDocuments}
-                                                className="md:hidden text-red-600"
-                                            >
-                                                Delete
-                                            </TabPillButtonUI>
-                                        </>
+                                        <SelectionActionsMenu
+                                            open={actionsOpen}
+                                            onOpenChange={setActionsOpen}
+                                            renderItems={(close) => renderReviewRowActions(selectedRowIds, close)}
+                                        />
                                     )}
                                     {!loading && (
                                         <TabPillButtonUI
@@ -1711,6 +1686,7 @@ export function TRView({ reviewId, projectId }: Props) {
                                 uploadingFilenames={uploadingDroppedFilenames}
                                 dragOverFiles={dragOverReviewFiles}
                                 onSelectionChange={setSelectedRowIds}
+                                rightClickDropdown={(row, close) => renderReviewRowActions(rowActionSelectionIds(row.id, selectedRowIds), close)}
                                 onDocumentOpen={handleDocumentOpen}
                                 onExpand={(cell) => {
                                     setExpandedCell(cell);
@@ -1843,42 +1819,48 @@ export function TRView({ reviewId, projectId }: Props) {
                 onAdd={handleAddColumn}
             />
 
-            {project ? (
-                <AddDocumentsModal
-                    open={addDocsOpen}
-                    onClose={() => setAddDocsOpen(false)}
-                    onSelect={(docs: Document[]) => handleAddDocuments(docs)}
-                    breadcrumb={[
-                        "Projects",
-                        project.name +
-                            (project.cm_number
-                                ? ` (#${project.cm_number})`
-                                : ""),
-                        "Tabular Reviews",
-                        ...(review ? [review.title || "Untitled Review"] : []),
-                        "Add Documents",
-                    ]}
-                    uploadStateId={`tabular-review:${review?.id ?? "new"}:project`}
-                    projectId={project.id}
-                    projectDocumentsOnly
-                    disabledDocumentIds={
-                        new Set(documents.map((document) => document.id))
-                    }
-                />
-            ) : (
-                <AddDocumentsModal
-                    open={addDocsOpen}
-                    onClose={() => setAddDocsOpen(false)}
-                    onSelect={(docs: Document[]) => handleAddDocuments(docs)}
-                    breadcrumb={[
-                        "Tabular Reviews",
-                        ...(review ? [review.title || "Untitled Review"] : []),
-                        "Add Documents",
-                    ]}
-                    uploadStateId={`tabular-review:${review?.id ?? "new"}:library`}
-                    tabs={["files", "projects"]}
-                />
-            )}
+            {/* The review's own workspace, which the dialogs list and
+                upload into: it takes documents from nowhere else. */}
+            <DocumentWorkspaceScope
+                orgId={review ? (review.org_id ?? null) : undefined}
+            >
+                {project ? (
+                    <AddDocumentsModal
+                        open={addDocsOpen}
+                        onClose={() => setAddDocsOpen(false)}
+                        onSelect={(docs: Document[]) => handleAddDocuments(docs)}
+                        breadcrumb={[
+                            "Projects",
+                            project.name +
+                                (project.cm_number
+                                    ? ` (#${project.cm_number})`
+                                    : ""),
+                            "Tabular Reviews",
+                            ...(review ? [review.title || "Untitled Review"] : []),
+                            "Add Documents",
+                        ]}
+                        uploadStateId={`tabular-review:${review?.id ?? "new"}:project`}
+                        projectId={project.id}
+                        projectDocumentsOnly
+                        disabledDocumentIds={
+                            new Set(documents.map((document) => document.id))
+                        }
+                    />
+                ) : (
+                    <AddDocumentsModal
+                        open={addDocsOpen}
+                        onClose={() => setAddDocsOpen(false)}
+                        onSelect={(docs: Document[]) => handleAddDocuments(docs)}
+                        breadcrumb={[
+                            "Tabular Reviews",
+                            ...(review ? [review.title || "Untitled Review"] : []),
+                            "Add Documents",
+                        ]}
+                        uploadStateId={`tabular-review:${review?.id ?? "new"}:library`}
+                        tabs={["files", "projects"]}
+                    />
+                )}
+            </DocumentWorkspaceScope>
 
             <TabularReviewDetailsModal
                 open={detailsOpen}
@@ -1906,8 +1888,15 @@ export function TRView({ reviewId, projectId }: Props) {
                 ]}
                 access={{
                     grants: grants ?? [],
-                    orgId: null,
+                    // A review that belongs to an organization is shared
+                    // with that organization's members only, so the dialog
+                    // offers them to pick from rather than any address.
+                    orgId:
+                        accessOrgId === undefined
+                            ? (review?.org_id ?? null)
+                            : accessOrgId,
                     ownerLabel: "Review owners",
+                    resourceNoun: "review",
                     inheritedFromProjectId: review?.project_id ?? null,
                     canManage: can(reviewRole, "access.manage"),
                     // The mutation is what AccessModal reports on. Reloading
@@ -1976,6 +1965,12 @@ export function TRView({ reviewId, projectId }: Props) {
                 onClose={() => setOwnerOnlyAction(null)}
             />
 
+            <WarningPopup
+                open={generationError !== null}
+                onClose={() => setGenerationError(null)}
+                title="Review stopped"
+                message={generationError}
+            />
             <WarningPopup
                 open={dropUploadWarning !== null}
                 onClose={() => setDropUploadWarning(null)}

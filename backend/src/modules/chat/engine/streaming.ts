@@ -10,23 +10,15 @@ import { UserFacingError } from "../../../lib/userFacingError";
 import { InvalidApiKeyError } from "../../../lib/llm/apiKeyErrors";
 import { reportError } from "../../../lib/observability/sentry";
 import type { Db } from "../../../lib/supabase";
-import { buildUserMcpTools, type McpToolEvent } from "../../../lib/mcpConnectors";
-import type { SourceDocument } from "../../../lib/sourceDocuments";
+import { buildUserMcpTools } from "../../../lib/mcpConnectors";
 import { buildGoogleDriveTools } from "../../../lib/integrations/googleDrive";
-import {
-  COURTLISTENER_TOOLS,
-  type CaseCitationEvent,
-  type CourtlistenerToolEvent,
-} from "./tools/courtlistenerTools";
+import { COURTLISTENER_TOOLS } from "./tools/courtlistenerTools";
 import {
   type DocStore,
   type DocIndex,
   type TabularCellStore,
   type WorkflowStore,
   type ToolCall,
-  type AskInputResponseItem,
-  type AskInputsEvent,
-  type EditAnnotation,
   devLog,
   resolveDocLabel,
   TOOL_ERROR_MESSAGE,
@@ -201,8 +193,16 @@ export async function runLLMStream(params: {
   docStore: DocStore;
   docIndex: DocIndex;
   userId: string;
+  /**
+   * The caller's authenticated email. Direct (email-keyed) grants are part of
+   * the per-document role check edit_document runs before it writes, so a
+   * surface that omits it only lets the model edit documents the caller
+   * reaches as creator or organization member.
+   */
+  userEmail?: string | null;
   db: Db;
   write: (s: string) => void;
+  onActivity?: () => void;
   extraTools?: unknown[];
   includeResearchTools?: boolean;
   /** Expose ask_inputs only to clients that can render and answer it. */
@@ -240,6 +240,12 @@ export async function runLLMStream(params: {
   /** AI SDK reasoning effort for this interactive request. */
   reasoning?: import("../../../lib/llm").ReasoningLevel;
   apiKeys?: import("../../../lib/llm").UserApiKeys;
+  /**
+   * The organization the conversation belongs to. `apiKeys` are already the
+   * ones it runs on; this is for the model-list check below, which must use
+   * the same organization's lists.
+   */
+  orgId?: string | null;
   signal?: AbortSignal;
   /** Let a route persist the completed turn before it signals stream success. */
   emitDone?: boolean;
@@ -271,6 +277,7 @@ export async function runLLMStream(params: {
     docStore,
     docIndex,
     userId,
+    userEmail,
     db,
     write: unsafeWrite,
     extraTools,
@@ -284,6 +291,7 @@ export async function runLLMStream(params: {
     buildCitations,
     model,
     apiKeys,
+    orgId,
     signal,
     projectId,
     includeMemory = false,
@@ -318,8 +326,13 @@ export async function runLLMStream(params: {
     : withoutDocumentMutatingTools(advertisedTools);
 
   // Extract system prompt; pass remaining turns to the adapter as
-  // plain user/assistant messages.
-  const rawMsgs = apiMessages as { role: string; content: string | null }[];
+  // plain user/assistant messages (assistant turns may carry stored
+  // reasoning, which only reasoning-replaying models receive).
+  const rawMsgs = apiMessages as {
+    role: string;
+    content: string | null;
+    reasoning?: string;
+  }[];
   const baseSystemPrompt =
     rawMsgs[0]?.role === "system" ? (rawMsgs[0].content ?? "") : "";
   const memory = await buildMemoryTurn({
@@ -328,16 +341,20 @@ export async function runLLMStream(params: {
     systemPrompt: baseSystemPrompt,
     include: includeMemory,
     projectId: memoryProjectId,
+    orgId,
     sharedAudience: memorySharedAudience,
   });
   const systemPrompt = memory.systemPrompt;
   const chatMessages: LlmMessage[] = rawMsgs
     .filter((m) => m.role !== "system")
     .map(
-      (m): LlmMessage => ({
-        role: m.role === "assistant" ? "assistant" : "user",
-        content: m.content ?? "",
-      }),
+      (m): LlmMessage =>
+        m.role === "assistant" && m.reasoning
+          ? { role: "assistant", content: m.content ?? "", reasoning: m.reasoning }
+          : {
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: m.content ?? "",
+            },
     )
     // An assistant turn with no text (an error, a cancellation, or a client
     // that keeps prose in events) carries nothing for the model, and Anthropic
@@ -502,6 +519,7 @@ export async function runLLMStream(params: {
       userId,
       db,
       "throw",
+      orgId,
     );
     await streamChatWithTools({
       model: selectedModel,
@@ -518,6 +536,7 @@ export async function runLLMStream(params: {
       abortSignal: signal,
       conversationId,
       callbacks: {
+        onActivity: params.onActivity,
         onContentDelta: (delta) => {
           iterText += delta;
           streamVisibleContent(delta);
@@ -618,7 +637,11 @@ export async function runLLMStream(params: {
           courtlistenerTurnState,
           apiKeys,
           nonce,
-          { connectorApprovals: connectorApprovals && includeAskInputs },
+          {
+            connectorApprovals: connectorApprovals && includeAskInputs,
+            userEmail,
+            orgId,
+          },
         );
         throwIfAborted(signal);
         for (const r of docsRead) {

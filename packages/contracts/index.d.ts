@@ -283,6 +283,8 @@ export type McpToolEvent = {
   connector_id: string;
   connector_name: string;
   tool_name: string;
+  /** Human-readable tool label from the connector, when it provides one. */
+  tool_title?: string;
   openai_tool_name: string;
   status: "ok" | "error";
   error?: string;
@@ -456,4 +458,98 @@ export interface NativeConnectorTool {
     description: string;
     write: boolean;
     enabled: boolean;
+}
+
+/** Organization departure preview: only public transfer items expose titles. */
+export interface OrgMemberHandover {
+    sharedChats: number;
+    sharedReviews: number;
+    sharedDocuments: number;
+    projects: { id: string; title: string }[];
+    workflows: { id: string; title: string }[];
+    privateProjects: number;
+    privateWorkflows: number;
+    chats: number;
+    reviews: number;
+    documents: number;
+}
+
+export type OrgPrivateContentKind = "project" | "workflow" | "chat" | "tabular_review" | "document";
+export interface OrgPrivateContentItem {
+    kind: OrgPrivateContentKind;
+    item_id: string;
+    title: string | null;
+    user_id: string | null;
+    display_name: string | null;
+    email: string | null;
+    has_access: boolean;
+}
+export interface OrgPrivateContentPage {
+    items: OrgPrivateContentItem[];
+    nextOffset: number | null;
+}
+
+/** Owner-only recovery list; these items are excluded from normal access. */
+export interface OrgDepartureArchive {
+    id: string;
+    kind: "project" | "workflow" | "chat" | "tabular_review" | "document";
+    item_id: string;
+    title: string;
+    archived_at: string;
+    expires_at: string;
+}
+export interface OrgDepartureArchivePage {
+    items: OrgDepartureArchive[];
+    nextOffset: number | null;
+}
+/** An archived item as the Departed members view lists it. */
+export interface OrgDepartureItem extends OrgDepartureArchive {
+    /** What a project or workflow holds; absent for the other kinds. */
+    contents?: { documents: number; chats: number; tabular_reviews: number };
+}
+/** The archived work one member left behind when they departed. */
+export interface OrgDeparture {
+    /** Identifies the departure for as long as any of its work is archived. */
+    key: string;
+    /** Null once the departed account has been deleted. */
+    member: {
+        user_id: string;
+        display_name: string | null;
+        email: string | null;
+    } | null;
+    departed_at: string;
+    /** When the earliest of its items is permanently deleted. */
+    expires_at: string;
+    items: OrgDepartureItem[];
+}
+/** Soonest deletion first. `truncated` when there was more than is listed. */
+export interface OrgDepartureList {
+    departures: OrgDeparture[];
+    truncated: boolean;
+}
+/** `unresolved` items could not be reassigned or deleted and are still archived. */
+export interface OrgDepartureResolution {
+    resolved: number;
+    unresolved: number;
+}
+
+/** A team organization still inside its owner-only recovery period. */
+export interface DeletedOrganization {
+    id: string;
+    name: string;
+    deleted_at: string;
+    purge_after: string;
+}
+
+/** An identity visible in an authorized organization's audit history. */
+export interface AuditActor {
+  user_id: string;
+  email: string | null;
+  display_name: string | null;
+  profile_photo: string | null;
+}
+
+export interface AuditActorPage {
+  users: AuditActor[];
+  nextOffset: number | null;
 }

@@ -60,6 +60,8 @@ interface FloatingHeaderProps {
   wordDocumentId: string;
   wordChatStorage: WordChatStorageMode;
   wordChatOwnerId: string;
+  /** The chat on screen, marked in the history menu. */
+  currentChatId?: string | null;
 }
 
 const SECTIONS = [
@@ -96,6 +98,7 @@ export function FloatingHeader({
   wordDocumentId,
   wordChatStorage,
   wordChatOwnerId,
+  currentChatId,
 }: FloatingHeaderProps): React.ReactElement {
   const [menuOpen, setMenuOpen] = useState(false);
   const [workflowActionsOpen, setWorkflowActionsOpen] = useState(false);
@@ -191,7 +194,7 @@ export function FloatingHeader({
       </div>
 
       {section === "chat" ? (
-        <HeaderButtonsUI className="pointer-events-auto relative z-10">
+        <HeaderButtonsUI className="pointer-events-auto relative z-10 backdrop-blur-2xl">
           {hasActiveChat && (
             <HeaderButtonUI
               iconOnly
@@ -207,10 +210,11 @@ export function FloatingHeader({
             documentId={wordDocumentId}
             ownerId={wordChatOwnerId}
             storageMode={wordChatStorage}
+            currentChatId={currentChatId}
           />
         </HeaderButtonsUI>
       ) : workflowDetailOpen ? (
-        <HeaderButtonsUI className="pointer-events-auto relative z-10">
+        <HeaderButtonsUI className="pointer-events-auto relative z-10 backdrop-blur-2xl">
           <Dropdown
             open={workflowActionsOpen}
             onOpenChange={setWorkflowActionsOpen}
@@ -245,7 +249,7 @@ export function FloatingHeader({
           </LiquidTextButton>
         </HeaderButtonsUI>
       ) : section === "history" ? (
-        <HeaderButtonsUI className="pointer-events-auto relative z-10">
+        <HeaderButtonsUI className="pointer-events-auto relative z-10 backdrop-blur-2xl">
           <HeaderButtonUI
             iconOnly
             onClick={onNewChat}
@@ -256,7 +260,7 @@ export function FloatingHeader({
           </HeaderButtonUI>
         </HeaderButtonsUI>
       ) : section === "workflows" ? (
-        <HeaderButtonsUI className="pointer-events-auto relative z-10">
+        <HeaderButtonsUI className="pointer-events-auto relative z-10 backdrop-blur-2xl">
           <HeaderButtonUI
             iconOnly
             onClick={onNewWorkflow}
@@ -267,7 +271,7 @@ export function FloatingHeader({
           </HeaderButtonUI>
         </HeaderButtonsUI>
       ) : section === "actions" ? (
-        <HeaderButtonsUI className="pointer-events-auto relative z-10">
+        <HeaderButtonsUI className="pointer-events-auto relative z-10 backdrop-blur-2xl">
           <HeaderButtonUI
             iconOnly
             onClick={onNewQuickAction}

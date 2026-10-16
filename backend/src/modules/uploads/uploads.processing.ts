@@ -14,7 +14,7 @@ import {
 
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, open, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, readFile, rm, stat } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
@@ -32,11 +32,11 @@ import {
 } from "../../lib/observability/pollFailureGate";
 import { asReportableError } from "../../lib/httpError";
 import { shouldConvertToPdf } from "../../lib/documentTypes";
+import { countPagesWithoutText } from "../../lib/pdfText";
 import { uploadJobWallClockMs } from "../../lib/runtimeConfig";
 import {
   copyFile,
   createFileReadStream,
-  deleteFile,
   deleteFileBestEffort,
   deleteFilesBestEffort,
   StorageOperationError,
@@ -207,6 +207,22 @@ async function countPdfPages(filePath: string): Promise<number | null> {
   }
 }
 
+// Measured once at upload so the document list can flag scanned PDFs without
+// re-reading them. Null when the PDF cannot be parsed.
+async function countTextlessPdfPages(filePath: string): Promise<number | null> {
+  try {
+    const bytes = await readFile(filePath);
+    return await countPagesWithoutText(
+      bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer,
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function buildPdfRendition(args: {
   sourceFilePath: string;
   workingDirectory: string;
@@ -223,9 +239,11 @@ async function buildPdfRendition(args: {
       args.sourceFilePath,
       args.workingDirectory,
     );
-    const key = args.versionSlug
-      ? `converted-pdfs/${args.userId}/${args.documentId}/${args.versionSlug}.pdf`
-      : convertedPdfKey(args.userId, args.documentId);
+    const key = convertedPdfKey(
+      args.userId,
+      args.documentId,
+      args.versionSlug,
+    );
     await uploadFileFromPath(key, pdfPath, "application/pdf");
     return key;
   } catch (error) {
@@ -386,6 +404,11 @@ async function processCreatedDocument(
     if (workflowError) throw new Error(workflowError.message);
     orgId = (workflowRow as { org_id?: string | null } | null)?.org_id ?? null;
   }
+  if (!orgId && (scope === "standalone" || scope === "library")) {
+    // Uploaded on its own: the workspace the session named, which was
+    // checked against the uploader's memberships when it was opened.
+    orgId = (destination.org_id as string | null | undefined) ?? null;
+  }
 
   // The upsert below is what makes a retry idempotent — and, on a retry, what
   // would silently RESURRECT a document the user deleted while this job was
@@ -450,6 +473,10 @@ async function processCreatedDocument(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
 
   const { error: versionError } = await createDocumentVersion(db, {
     id: versionId,
@@ -462,6 +489,7 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // The document went while we were converting: stop, and hand the bytes we
@@ -488,6 +516,7 @@ async function processCreatedDocument(
     userId: session.user_id,
     userEmail: session.user_email,
     action: "document.uploaded",
+    orgId: document.org_id ?? null,
     title: file.filename,
     surface: projectId ? "project" : "assistant",
     projectId,
@@ -506,6 +535,7 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     active_version_number: 1,
   };
 }
@@ -540,6 +570,10 @@ async function processNewDocumentVersion(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
 
   const { data: version, error } = await createDocumentVersion(db, {
     id: versionId,
@@ -552,6 +586,7 @@ async function processNewDocumentVersion(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // Adding a version to a document that has been deleted is the same race as
@@ -570,6 +605,7 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
+    textless_page_count,
   } = version;
   return {
     id,
@@ -580,6 +616,7 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
+    textless_page_count,
   };
 }
 
@@ -650,6 +687,10 @@ async function processReplacementDocumentVersion(
       });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
   const { data: updated, error } = await updateDocumentVersion(
     db,
     documentId,
@@ -661,6 +702,7 @@ async function processReplacementDocumentVersion(
       file_type: file.file_type,
       size_bytes: artifact.size,
       page_count: pageCount,
+      textless_page_count: textlessPageCount,
       content_sha256: artifact.sha256,
       created_at: new Date().toISOString(),
     },

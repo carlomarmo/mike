@@ -46,7 +46,7 @@ import {
     type ToolCacheRow,
 } from "./types";
 
-export { startUserMcpConnectorOAuth, validateRemoteMcpUrl };
+export { startUserMcpConnectorOAuth };
 
 async function withMcpClient<T>(
     connector: ConnectorRow,
@@ -470,7 +470,6 @@ export async function buildUserMcpTools(
             ? connector[0]?.name
             : connector?.name;
         const toolName = String(raw.tool_name);
-        const title = typeof raw.title === "string" ? raw.title : toolName;
         const description =
             typeof raw.description === "string" && raw.description.trim()
                 ? raw.description
@@ -755,6 +754,7 @@ async function callResolvedTool(
                     connector_id: connector.id,
                     connector_name: connector.name,
                     tool_name: tool.tool_name,
+                    ...(tool.title ? { tool_title: tool.title } : {}),
                     openai_tool_name: tool.openai_tool_name,
                     status: "error",
                     error: toolError,
@@ -779,6 +779,7 @@ async function callResolvedTool(
                 connector_id: connector.id,
                 connector_name: connector.name,
                 tool_name: tool.tool_name,
+                ...(tool.title ? { tool_title: tool.title } : {}),
                 openai_tool_name: tool.openai_tool_name,
                 status: "ok",
             },
@@ -829,6 +830,7 @@ async function callResolvedTool(
                 connector_id: connector.id,
                 connector_name: connector.name,
                 tool_name: tool.tool_name,
+                ...(tool.title ? { tool_title: tool.title } : {}),
                 openai_tool_name: tool.openai_tool_name,
                 status: "error",
                 error: diagnostic.message,

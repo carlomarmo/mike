@@ -6,6 +6,12 @@ import React, {
   useState,
 } from "react";
 import { Library, X } from "lucide-react";
+import { ExcerptModalUI } from "@mike/excerpt-modal-ui";
+import { ExcerptPillUI } from "@mike/excerpt-pill-ui";
+import {
+  serializeExcerpts,
+  type MessageExcerpt,
+} from "@mike/message-excerpts";
 import { WorkflowModal } from "../workflows/WorkflowModal";
 import { ChatInput as ChatInputShell } from "../../../shared/chat/ChatInput";
 import {
@@ -37,7 +43,16 @@ import type {
   WordChatSubmission,
   WordChatSubmitOptions,
 } from "../../lib/wordChatTypes";
-import { isModelAvailable, missingModelProvider } from "../../lib/modelCatalog";
+import {
+  NO_MODELS_MESSAGES,
+  routerSelections as routerSelectionsFromProfile,
+  type RouterSelections,
+} from "@mike/model-catalog";
+import {
+  isModelAvailable,
+  noModelsReason,
+  unavailableModelMessage,
+} from "../../lib/modelCatalog";
 import { loadWithRetry } from "../../lib/composerPreflight";
 import {
   slashCommandQueryFromValue,
@@ -52,6 +67,8 @@ import {
 export interface ChatInputHandle {
   setDraft: (prompt: string) => void;
   requestDocuments: () => void;
+  /** Quotes a passage of an assistant response above the next message. */
+  addExcerpt: (excerpt: MessageExcerpt) => void;
 }
 
 interface ChatInputProps {
@@ -104,6 +121,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
   ): React.ReactElement {
     const [input, setInput] = useState("");
     const [attachedDocuments, setAttachedDocuments] = useState<Document[]>([]);
+    const [excerpts, setExcerpts] = useState<MessageExcerpt[]>([]);
+    const [openExcerpt, setOpenExcerpt] = useState<MessageExcerpt | null>(null);
+    // An annotated excerpt already says what is being asked about it.
+    const hasAnnotatedExcerpt = excerpts.some((excerpt) => excerpt.note);
     const [documentsModalOpen, setDocumentsModalOpen] = useState(false);
     const [workflowModalOpen, setWorkflowModalOpen] = useState(false);
     const [uploadingLocalFiles, setUploadingLocalFiles] = useState(false);
@@ -112,9 +133,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     >(null);
     const [keyStatus, setKeyStatus] = useState<ApiKeyStatus | null>(null);
     const [keyStatusLoading, setKeyStatusLoading] = useState(true);
-    const [openRouterModels, setOpenRouterModels] = useState<string[]>([]);
-    const [vercelModels, setVercelModels] = useState<string[]>([]);
-    const [openCodeGoModels, setOpenCodeGoModels] = useState<string[]>([]);
+    // Null until the profile loads: stored router selections cannot be
+    // checked against saved Model Selections before then.
+    const [routerSelections, setRouterSelections] =
+      useState<RouterSelections | null>(null);
     const [profileLastSelectedModel, setProfileLastSelectedModel] = useState<
       string | null
     >(null);
@@ -123,9 +145,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       sessionKey,
       chatModel,
       lastSelectedModel: lastSelectedModel ?? profileLastSelectedModel,
-      routerSelections: profileLoaded
-        ? { openRouterModels, vercelModels, openCodeGoModels }
-        : null,
+      routerSelections: profileLoaded ? routerSelections : null,
       apiKeyStatus: keyStatus,
     });
     const [modelError, setModelError] = useState<string | null>(null);
@@ -179,6 +199,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       () => ({
         setDraft: (prompt: string): void => setInput(prompt),
         requestDocuments: (): void => setDocumentsModalOpen(true),
+        addExcerpt: (excerpt: MessageExcerpt): void =>
+          setExcerpts((current) =>
+            current.some(
+              (item) => item.text === excerpt.text && item.note === excerpt.note,
+            )
+              ? current
+              : [...current, excerpt],
+          ),
       }),
       [],
     );
@@ -241,9 +269,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         if (cancelled) return;
         setKeyStatus(status);
         if (profile) {
-          setOpenRouterModels(profile.openRouterModels ?? []);
-          setVercelModels(profile.vercelModels ?? []);
-          setOpenCodeGoModels(profile.openCodeGoModels ?? []);
+          setRouterSelections(routerSelectionsFromProfile(profile));
           setProfileLastSelectedModel(profile.lastSelectedChatModel ?? null);
           setProfileLastSelectedReasoningLevel(
             profile.lastSelectedReasoningLevel ?? "high",
@@ -401,15 +427,13 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         selectSlashWorkflow(exactSlashWorkflow);
         return;
       }
-      if (!content || isResponseLoading) return;
+      if ((!content && !hasAnnotatedExcerpt) || isResponseLoading) return;
       if (!model) {
         setModelError("Select a model before sending your message.");
         return;
       }
       if (!isModelAvailable(model, keyStatus)) {
-        setModelError(
-          `Add a ${missingModelProvider(model)} API key before using this model.`,
-        );
+        setModelError(unavailableModelMessage(model, keyStatus));
         return;
       }
       setModelError(null);
@@ -419,7 +443,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       }));
       void onSubmit(
         {
-          content,
+          content: serializeExcerpts(excerpts, content),
           files: files.length > 0 ? files : undefined,
           workflow: selectedWorkflow ?? undefined,
           model,
@@ -429,6 +453,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
           onAccepted: () => {
             setInput("");
             setAttachedDocuments([]);
+            setExcerpts([]);
             onSelectedWorkflowChange(null);
           },
           onTurnReady,
@@ -537,11 +562,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
               onCancel={onCancel}
               disabled={false}
               placeholder="How can I help?"
+              canSubmitEmpty={hasAnnotatedExcerpt}
               attachments={
-                selectedWorkflow || attachedDocuments.length > 0 ? (
+                selectedWorkflow ||
+                attachedDocuments.length > 0 ||
+                excerpts.length > 0 ? (
                   <>
                     {selectedWorkflow && (
-                      <div className="inline-flex items-center gap-1 rounded-full border border-white/20 bg-blue-600 py-0.5 pl-2.5 pr-1 text-xs text-white shadow backdrop-blur-sm">
+                      <div className="inline-flex items-center gap-1 rounded-full border border-white/20 bg-blue-600 py-0.5 pl-2.5 pr-1 text-xs text-white shadow">
                         <Library className="h-2.5 w-2.5 shrink-0" />
                         <span className="max-w-[140px] truncate">
                           {selectedWorkflow.title}
@@ -559,7 +587,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                     {attachedDocuments.map((document) => (
                       <div
                         key={document.id}
-                        className="inline-flex items-center gap-1 rounded-[10px] border border-white/70 bg-white py-0.5 pl-2 pr-1 text-xs text-gray-800 shadow-sm backdrop-blur-xl"
+                        className="inline-flex items-center gap-1 rounded-[10px] border border-white/70 bg-white py-0.5 pl-2 pr-1 text-xs text-gray-800 shadow-sm"
                       >
                         <FileTypeIcon
                           fileType={document.file_type ?? document.filename}
@@ -581,6 +609,18 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                           <X className="h-2.5 w-2.5" />
                         </button>
                       </div>
+                    ))}
+                    {excerpts.map((excerpt, index) => (
+                      <ExcerptPillUI
+                        key={`${index}-${excerpt.text}`}
+                        excerpt={excerpt}
+                        onOpen={() => setOpenExcerpt(excerpt)}
+                        onRemove={() =>
+                          setExcerpts((current) =>
+                            current.filter((_, i) => i !== index),
+                          )
+                        }
+                      />
                     ))}
                   </>
                 ) : undefined
@@ -615,9 +655,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                     }}
                     keyStatus={keyStatus}
                     keyStatusLoading={keyStatusLoading}
-                    openRouterModels={openRouterModels}
-                    vercelModels={vercelModels}
-                    openCodeGoModels={openCodeGoModels}
+                    routerSelections={routerSelections}
                     compact={compactControls}
                     reasoningLevel={resolvedReasoningLevel}
                     onReasoningChange={(next) => {
@@ -629,16 +667,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
                           .then(() => onReasoningSelected(next));
                     }}
                     onNoModelsClick={() => {
-                      const routerHasNoModels =
-                        (keyStatus?.openrouter &&
-                          openRouterModels.length === 0) ||
-                        (keyStatus?.vercel && vercelModels.length === 0) ||
-                        (keyStatus?.["opencode-go"] &&
-                          openCodeGoModels.length === 0);
                       setModelError(
-                        routerHasNoModels
-                          ? "Your router is connected, but it has no saved models. Add one in Bring Your Own Keys → Routers."
-                          : "Add an API key in Bring Your Own Keys before selecting a model.",
+                        NO_MODELS_MESSAGES[
+                          noModelsReason(keyStatus, routerSelections ?? {})
+                        ],
                       );
                     }}
                   />
@@ -647,6 +679,10 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             />
           </div>
         </div>
+        <ExcerptModalUI
+          excerpt={openExcerpt}
+          onClose={() => setOpenExcerpt(null)}
+        />
         <AddDocumentsModal
           open={documentsModalOpen}
           onClose={() => setDocumentsModalOpen(false)}

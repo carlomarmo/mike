@@ -79,10 +79,8 @@ vi.mock("@/app/contexts/SidebarContext", () => ({
 vi.mock("@/app/hooks/useConfiguredModels", () => ({
     useConfiguredModels: () => [],
 }));
-vi.mock("../assistant/ModelToggle", () => ({
-    SETTINGS_MODELS: [
-        { id: "claude-sonnet-5", label: "Claude Sonnet 5", group: "Anthropic" },
-    ],
+vi.mock("../assistant/ModelToggle", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../assistant/ModelToggle")>()),
     ModelToggle: () => null,
 }));
 vi.mock("./TRTable", () => ({ TRTable: () => <div /> }));
@@ -176,6 +174,44 @@ describe("TabularReviewView server-owned generation", () => {
             removeEventListener: vi.fn(),
             dispatchEvent: vi.fn(),
         }));
+    });
+
+    it("shows a server deadline error to the user", async () => {
+        mockDetail({});
+        const stream = openStream();
+        vi.mocked(streamTabularGeneration).mockResolvedValue(stream.response);
+        render(<TRView reviewId="r1" />);
+        fireEvent.click(await screen.findByTitle("Run review"));
+        await screen.findByTitle("Stop generation");
+        const message =
+            "The request timed out because it stopped responding. Please try again.";
+        stream.push(
+            `data: ${JSON.stringify({ type: "error", message, safe_to_display: true })}\n\n`,
+        );
+        stream.done();
+        await screen.findByTitle("Run review");
+        expect(await screen.findByText(message)).toBeInTheDocument();
+    });
+
+    it("hides unsafe server error details", async () => {
+        mockDetail({});
+        const stream = openStream();
+        vi.mocked(streamTabularGeneration).mockResolvedValue(stream.response);
+        render(<TRView reviewId="r1" />);
+        fireEvent.click(await screen.findByTitle("Run review"));
+        await screen.findByTitle("Stop generation");
+        const message = "internal database credential details";
+        stream.push(
+            `data: ${JSON.stringify({ type: "error", message, safe_to_display: false })}\n\n`,
+        );
+        stream.done();
+        await screen.findByTitle("Run review");
+        expect(
+            await screen.findByText(
+                "The review could not be completed. Please try again.",
+            ),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(message)).not.toBeInTheDocument();
     });
 
     it("stops through the endpoint instead of dropping the stream", async () => {

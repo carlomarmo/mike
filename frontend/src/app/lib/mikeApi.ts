@@ -1,3 +1,19 @@
+import type {
+    AuditActorPage,
+    OrgMemberHandover,
+    OrgDepartureList,
+    OrgDepartureResolution,
+} from "@mike/contracts";
+export type {
+    AuditActor,
+    AuditActorPage,
+    OrgMemberHandover,
+    OrgDeparture,
+    OrgDepartureItem,
+    OrgDepartureList,
+    OrgDepartureResolution,
+} from "@mike/contracts";
+
 /**
  * Mike API client — all browser requests use the same-origin `/api` gateway.
  * Authentication is carried only by the backend-managed HttpOnly cookie.
@@ -5,6 +21,7 @@
 
 import { isPanelDocument } from "@/app/components/shared/types";
 import { authenticatedFetch } from "@/app/lib/authEvents";
+import type { RouterProfileLists } from "@/shared/lib/modelCatalog";
 import {
     markErrorHandled,
     reportApiFailure,
@@ -27,6 +44,7 @@ import {
 // gives it meaning, and re-exported here so API consumers do not need two
 // imports to describe one row.
 import type {
+    InvitableOrgRole,
     OrgRole,
     OrganizationAccessOverride,
     ProjectRole,
@@ -41,6 +59,7 @@ import type {
     ChatDetailOut,
     ActiveAssistantTurn,
     Citation,
+    ContentVisibility,
     Document,
     Folder,
     LibraryFolder,
@@ -396,9 +415,17 @@ export async function listProjectsPage(pagination?: {
     search?: string;
     sortKey?: string;
     sortDirection?: "asc" | "desc";
-    scope?: "all" | "mine" | "shared" | "collaborative" | "private";
+    scope?:
+        | "all"
+        | "mine"
+        | "shared"
+        | "collaborative"
+        | "private"
+        | "public"
+        | "nonpublic";
     practice?: string;
     ownerUserId?: string;
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<Project[]> {
     const params = new URLSearchParams();
@@ -413,6 +440,7 @@ export async function listProjectsPage(pagination?: {
     if (pagination?.practice) params.set("practice", pagination.practice);
     if (pagination?.ownerUserId)
         params.set("owner_user_id", pagination.ownerUserId);
+    if (pagination?.workspace) params.set("workspace", pagination.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<Project[]>(`/projects${qs}`, {
@@ -423,6 +451,7 @@ export async function listProjectsPage(pagination?: {
 export async function listProjectSummaries(pagination?: {
     limit?: number;
     offset?: number;
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<Project[]> {
     const params = new URLSearchParams();
@@ -431,6 +460,7 @@ export async function listProjectSummaries(pagination?: {
     if (pagination?.offset != null)
         params.set("offset", String(pagination.offset));
     params.set("view", "summary");
+    if (pagination?.workspace) params.set("workspace", pagination.workspace);
     return apiRequest<Project[]>(`/projects?${params.toString()}`, {
         signal: pagination?.signal,
     });
@@ -469,6 +499,8 @@ export async function searchProjectDirectory(options: {
     search: string;
     limit?: number;
     offset?: number;
+    /** Narrow to one workspace: "personal" or an organization's id. */
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<Project[]> {
     const params = new URLSearchParams({
@@ -477,6 +509,7 @@ export async function searchProjectDirectory(options: {
     });
     if (options.limit != null) params.set("limit", String(options.limit));
     if (options.offset != null) params.set("offset", String(options.offset));
+    if (options.workspace) params.set("workspace", options.workspace);
     return apiRequest<Project[]>(`/projects?${params}`, {
         signal: options.signal,
     });
@@ -484,9 +517,17 @@ export async function searchProjectDirectory(options: {
 
 export async function listProjectIds(options?: {
     search?: string;
-    scope?: "all" | "mine" | "shared" | "collaborative" | "private";
+    scope?:
+        | "all"
+        | "mine"
+        | "shared"
+        | "collaborative"
+        | "private"
+        | "public"
+        | "nonpublic";
     practice?: string;
     ownerUserId?: string;
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<{ id: string; user_id: string }[]> {
     const params = new URLSearchParams();
@@ -495,6 +536,7 @@ export async function listProjectIds(options?: {
         params.set("scope", options.scope);
     if (options?.practice) params.set("practice", options.practice);
     if (options?.ownerUserId) params.set("owner_user_id", options.ownerUserId);
+    if (options?.workspace) params.set("workspace", options.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<{ id: string; user_id: string }[]>(`/projects/ids${qs}`, {
@@ -509,8 +551,12 @@ export interface ProjectFilterOptions {
 
 export async function getProjectFilterOptions(
     signal?: AbortSignal,
+    workspace?: string,
 ): Promise<ProjectFilterOptions> {
-    return apiRequest<ProjectFilterOptions>("/projects/filter-options", {
+    const qs = workspace
+        ? `?${new URLSearchParams({ workspace }).toString()}`
+        : "";
+    return apiRequest<ProjectFilterOptions>(`/projects/filter-options${qs}`, {
         signal,
     });
 }
@@ -521,6 +567,7 @@ export async function createProject(
     practice?: string,
     org_id?: string,
     memory_enabled?: boolean,
+    visibility?: ContentVisibility,
 ): Promise<Project> {
     return apiRequest<Project>("/projects", {
         method: "POST",
@@ -531,6 +578,7 @@ export async function createProject(
             practice,
             org_id,
             memory_enabled,
+            visibility,
         }),
     });
 }
@@ -572,17 +620,32 @@ export interface MemoryCurrent {
     status_updated_at?: string;
 }
 
+/**
+ * The caller's own memory. They have one per workspace — Personal, and one
+ * for each organization they belong to — each private to them. `workspace`
+ * names which ("personal" or an organization id); omitted, it is Personal.
+ */
+function userMemoryPath(path: string, workspace?: string): string {
+    return workspace
+        ? `${path}?${new URLSearchParams({ workspace }).toString()}`
+        : path;
+}
+
 export async function getUserMemory(
     signal?: AbortSignal,
+    workspace?: string,
 ): Promise<MemoryCurrent> {
-    return apiRequest<MemoryCurrent>("/user/memory", { signal });
+    return apiRequest<MemoryCurrent>(userMemoryPath("/user/memory", workspace), {
+        signal,
+    });
 }
 
 export async function updateUserMemory(
     content: string,
     expectedRevision: number,
+    workspace?: string,
 ): Promise<MemoryCurrent> {
-    return apiRequest<MemoryCurrent>("/user/memory", {
+    return apiRequest<MemoryCurrent>(userMemoryPath("/user/memory", workspace), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -594,12 +657,16 @@ export async function updateUserMemory(
 
 export async function setUserMemoryEnabled(
     enabled: boolean,
+    workspace?: string,
 ): Promise<MemoryCurrent> {
-    return apiRequest<MemoryCurrent>("/user/memory/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
-    });
+    return apiRequest<MemoryCurrent>(
+        userMemoryPath("/user/memory/settings", workspace),
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled }),
+        },
+    );
 }
 
 export async function getProjectMemory(
@@ -644,31 +711,10 @@ export async function setProjectMemoryEnabled(
     );
 }
 
-export async function exportAccountData(): Promise<{
-    blob: Blob;
-    filename: string | null;
-}> {
-    return apiBlobRequest("/user/export");
-}
-
-export async function exportChatData(): Promise<{
-    blob: Blob;
-    filename: string | null;
-}> {
-    return apiBlobRequest("/user/chats/export");
-}
-
-export async function exportTabularReviewsData(): Promise<{
-    blob: Blob;
-    filename: string | null;
-}> {
-    return apiBlobRequest("/user/tabular-reviews/export");
-}
-
 // --- Async (durable) exports -----------------------------------------------
 // POST schedules a backend job that builds the export off the request thread;
 // the status endpoint is polled until "done"; the download endpoint streams
-// the artifact. Unlike the legacy GET exports above, a large export can
+// the artifact. Unlike a synchronous GET export, a large export can
 // neither time out the request nor die with a closed tab, and a re-click
 // while one is building dedupes onto the running job.
 
@@ -687,7 +733,7 @@ export type UserExportStatus =
 
 /**
  * `params` carries the inputs of the filtered exports — the History CSV's
- * filter values (wire names: q/action/status/surface/from/to/sort_by/sort_dir)
+ * filter values (including username and event_ids for selected audit entries)
  * and documents-zip's `document_ids`. The backend re-validates them and 400s
  * on anything it would have rejected on the synchronous route.
  */
@@ -738,7 +784,8 @@ export interface PersonalisationDetails {
     professionalTitle?: ProfessionalTitle | null;
     practiceAreas?: string[];}
 
-export interface UserProfile {
+export interface UserProfile extends RouterProfileLists {
+    profilePhoto?: string | null;
     displayName: string | null;
     organisation: string | null;
     jurisdiction: string | null;
@@ -762,10 +809,18 @@ export interface UserProfile {
     quickActionsVisible: boolean;
     darkMode: boolean;
     projectMemoryDefault: boolean;
-    openRouterModels: string[];
-    vercelModels: string[];
-    openCodeGoModels: string[];
     apiKeyStatus: ApiKeyStatus;
+}
+
+/** Uploads a cropped profile-photo data URL, or removes the current photo when passed null. */
+export async function setUserProfilePhoto(photo: string | null): Promise<{ profilePhoto: string | null }> {
+    return apiRequest("/user/profile/photo", photo === null
+        ? { method: "DELETE" }
+        : {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ data_url: photo }),
+        });
 }
 
 export interface UserLookupResult {
@@ -779,9 +834,14 @@ export interface UserLookupResult {
 // ---------------------------------------------------------------------------
 
 export interface AuditEvent {
+    org_id?: string | null;
     id: string;
     created_at: string;
     user_display_name: string | null;
+    /** Current name of the affected member or invitation recipient. */
+    affected_user_display_name?: string | null;
+    /** Current photo of an actor in the authorized organization audit page. */
+    user_profile_photo?: string | null;
     user_email: string | null;
     action: string;
     status: string;
@@ -797,6 +857,9 @@ export interface AuditEvent {
 
 export async function getAuditHistory(
     params: {
+        orgId?: string;
+        username?: string;
+        actorUserId?: string;
         q?: string;
         action?: string;
         status?: string;
@@ -815,6 +878,9 @@ export async function getAuditHistory(
     pageSize: number;
 }> {
     const qs = new URLSearchParams();
+    if (params.orgId) qs.set("org_id", params.orgId);
+    if (params.username) qs.set("username", params.username);
+    if (params.actorUserId) qs.set("actor_user_id", params.actorUserId);
     if (params.q) qs.set("q", params.q);
     if (params.action) qs.set("action", params.action);
     if (params.status) qs.set("status", params.status);
@@ -827,26 +893,15 @@ export async function getAuditHistory(
     return apiRequest(`/audit?${qs.toString()}`, { signal });
 }
 
-export async function exportAuditHistory(params: {
-    q?: string;
-    action?: string;
-    status?: string;
-    surface?: string;
-    from?: string;
-    to?: string;
-    sortBy?: "created_at" | "user_email" | "title" | "model";
-    sortDirection?: "asc" | "desc";
-}): Promise<{ blob: Blob; filename: string | null }> {
-    const qs = new URLSearchParams();
-    if (params.q) qs.set("q", params.q);
-    if (params.action) qs.set("action", params.action);
-    if (params.status) qs.set("status", params.status);
-    if (params.surface) qs.set("surface", params.surface);
-    if (params.from) qs.set("from", params.from);
-    if (params.to) qs.set("to", params.to);
-    if (params.sortBy) qs.set("sort_by", params.sortBy);
-    if (params.sortDirection) qs.set("sort_dir", params.sortDirection);
-    return apiBlobRequest(`/audit/export?${qs.toString()}`);
+/** Search the people represented in an organization's audit log, one page at a time. */
+export async function getAuditActors(
+    params: { orgId: string; search?: string; offset?: number },
+    signal?: AbortSignal,
+): Promise<AuditActorPage> {
+    const qs = new URLSearchParams({ org_id: params.orgId });
+    if (params.search) qs.set("q", params.search);
+    if (params.offset) qs.set("offset", String(params.offset));
+    return apiRequest(`/audit/actors?${qs.toString()}`, { signal });
 }
 
 export async function getUserProfile(): Promise<UserProfile> {
@@ -877,14 +932,100 @@ export async function updateUserProfile(payload: {
     quickActionsVisible?: boolean;
     darkMode?: boolean;
     projectMemoryDefault?: boolean;
-    openRouterModels?: string[];
-    vercelModels?: string[];
-    openCodeGoModels?: string[];
-}): Promise<UserProfile> {
+} & Partial<RouterProfileLists>): Promise<UserProfile> {
     return apiRequest<UserProfile>("/user/profile", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+    });
+}
+
+export interface CustomInstructions {
+    content: string;
+}
+
+export async function getCustomInstructions(
+    signal?: AbortSignal,
+): Promise<CustomInstructions> {
+    return apiRequest<CustomInstructions>("/user/custom-instructions", {
+        signal,
+    });
+}
+
+export async function updateCustomInstructions(
+    content: string,
+): Promise<CustomInstructions> {
+    return apiRequest<CustomInstructions>("/user/custom-instructions", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+    });
+}
+
+/**
+ * Mirrors RESPONSE_STYLE_OPTIONS in the backend user module. The language
+ * codes mirror backend/src/lib/responseLanguages.ts and are listed in the
+ * order the selector shows them.
+ */
+export const RESPONSE_STYLE_OPTIONS = {
+    verbosity: ["concise", "balanced", "detailed"],
+    formatting: ["balanced", "less", "more"],
+    tone: ["formal", "balanced", "plain"],
+    language: [
+        "auto",
+        "en-US",
+        "en-GB",
+        "ar",
+        "zh-Hans",
+        "zh-Hant",
+        "cs",
+        "da",
+        "nl",
+        "fi",
+        "fr",
+        "de",
+        "el",
+        "he",
+        "hi",
+        "id",
+        "it",
+        "ja",
+        "ko",
+        "ms",
+        "nb",
+        "pl",
+        "pt-BR",
+        "pt-PT",
+        "ru",
+        "es",
+        "sv",
+        "th",
+        "tr",
+        "uk",
+        "vi",
+    ],
+} as const;
+
+export type ResponseStyleField = keyof typeof RESPONSE_STYLE_OPTIONS;
+
+export type ResponseStyle = {
+    [Field in ResponseStyleField]: (typeof RESPONSE_STYLE_OPTIONS)[Field][number];
+};
+
+export async function getResponseStyle(
+    signal?: AbortSignal,
+): Promise<ResponseStyle> {
+    return apiRequest<ResponseStyle>("/user/response-style", { signal });
+}
+
+/** Sends only the changed fields; the response is the full saved style. */
+export async function updateResponseStyle(
+    update: Partial<ResponseStyle>,
+): Promise<ResponseStyle> {
+    return apiRequest<ResponseStyle>("/user/response-style", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(update),
     });
 }
 
@@ -918,26 +1059,50 @@ export type ApiKeyProvider =
     | "claude"
     | "gemini"
     | "openai"
+    | "mistral"
     | "openrouter"
     | "vercel"
     | "opencode-go"
+    | "bedrock"
+    | "azure"
+    | "azure-foundry"
+    | "vertex"
+    | "xai"
+    | "custom"
     | "courtlistener";
-type ApiKeySource = "user" | "env" | null;
+/**
+ * Whose key a provider runs on: the person's own, their organization's, or
+ * the deployment's. "org" only ever appears in an organization's status.
+ */
+type ApiKeySource = "user" | "org" | "env" | null;
+
+/**
+ * The non-secret setting saved with a user's own key: the AWS region of a
+ * Bedrock key, the Azure resource of an Azure OpenAI or Azure AI Foundry key,
+ * the Vertex AI location of a service-account key, the base URL of a custom
+ * OpenAI-compatible endpoint.
+ */
+export type ApiKeySettings = {
+    bedrock?: { region: string } | null;
+    azure?: { endpoint: string } | null;
+    "azure-foundry"?: { endpoint: string } | null;
+    vertex?: { location: string } | null;
+    custom?: { baseUrl: string } | null;
+};
 export type ApiKeyState = Record<
     ApiKeyProvider,
     {
         configured: boolean;
         source: ApiKeySource;
+        enabled?: boolean;
     }
 >;
 
 export type ApiKeyStatus = Record<ApiKeyProvider, boolean> & {
     sources?: Partial<Record<ApiKeyProvider, ApiKeySource>>;
+    enabled?: Partial<Record<ApiKeyProvider, boolean>>;
+    settings?: ApiKeySettings;
 };
-
-export async function getApiKeyStatus(): Promise<ApiKeyStatus> {
-    return apiRequest<ApiKeyStatus>("/user/api-keys");
-}
 
 export interface OllamaModelOption {
     id: string;
@@ -978,35 +1143,87 @@ export async function getConfiguredModels(): Promise<ConfiguredModelOption[]> {
     return models;
 }
 
-export async function getOpenRouterModels(): Promise<RouterCatalogModel[]> {
+/**
+ * A provider's model catalog. With `workspace` set to an organization id it
+ * is listed with the key that organization's work runs on — how its admins
+ * choose the models its key may run — and otherwise with the caller's own.
+ */
+async function getProviderCatalog(
+    provider: string,
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    const query = workspace
+        ? `?workspace=${encodeURIComponent(workspace)}`
+        : "";
     const { models } = await apiRequest<{ models: RouterCatalogModel[] }>(
-        "/models/openrouter",
+        `/models/${provider}${query}`,
     );
     return models;
 }
 
-export async function getVercelModels(): Promise<RouterCatalogModel[]> {
-    const { models } = await apiRequest<{ models: RouterCatalogModel[] }>(
-        "/models/vercel",
-    );
-    return models;
+export function getOpenRouterModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("openrouter", workspace);
 }
 
-export async function getOpenCodeGoModels(): Promise<RouterCatalogModel[]> {
-    const { models } = await apiRequest<{ models: RouterCatalogModel[] }>(
-        "/models/opencode-go",
-    );
-    return models;
+export function getVercelModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("vercel", workspace);
 }
 
+export function getBedrockModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("bedrock", workspace);
+}
+
+export function getXaiModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("xai", workspace);
+}
+
+/** Models reported by the user's own OpenAI-compatible endpoint. */
+export function getCustomEndpointModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("custom", workspace);
+}
+
+export function getOpenCodeGoModels(
+    workspace?: string,
+): Promise<RouterCatalogModel[]> {
+    return getProviderCatalog("opencode-go", workspace);
+}
+
+/**
+ * Save, replace or remove a key. Keys that are saved with a setting (a region,
+ * endpoint, location or base URL) also send it; a setting with a null key changes the saved key's setting only.
+ */
 export async function saveApiKey(
     provider: ApiKeyProvider,
     apiKey: string | null,
+    settings?: ApiKeySettings[keyof ApiKeySettings],
 ): Promise<ApiKeyStatus> {
     return apiRequest<ApiKeyStatus>(`/user/api-keys/${provider}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: apiKey }),
+        body: JSON.stringify(
+            settings ? { api_key: apiKey, settings } : { api_key: apiKey },
+        ),
+    });
+}
+
+export async function setApiKeyEnabled(
+    provider: ApiKeyProvider,
+    enabled: boolean,
+): Promise<ApiKeyStatus> {
+    return apiRequest<ApiKeyStatus>(`/user/api-keys/${provider}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
     });
 }
 
@@ -1223,6 +1440,7 @@ export async function updateProject(
         name?: string;
         cm_number?: string;
         practice?: string | null;
+        visibility?: ContentVisibility;
     },
 ): Promise<Project> {
     return apiRequest<Project>(`/projects/${projectId}`, {
@@ -1239,7 +1457,7 @@ export async function deleteProject(projectId: string): Promise<void> {
 /**
  * Someone who can administer a resource, with an address to reach them.
  * `source` says how they got there: the creator, a direct Owner grant, or
- * being an Admin of the owning organization.
+ * being an Owner or Admin of the owning organization.
  */
 export interface ProjectContact {
     user_id: string | null;
@@ -1259,6 +1477,7 @@ export interface ProjectPeople {
         user_id: string;
         email: string | null;
         display_name: string | null;
+        profile_photo?: string | null;
         role?: ProjectRole;
     } | null;
     /** Direct recipients and their grant roles. */
@@ -1266,6 +1485,7 @@ export interface ProjectPeople {
         user_id?: string | null;
         email: string;
         display_name: string | null;
+        profile_photo?: string | null;
         role?: AccessAssignmentRole;
     }[];
     admin_contacts?: ProjectContact[];
@@ -1365,6 +1585,12 @@ export interface Org {
     updated_at?: string;
     /** The caller's role in this org. */
     role: OrgRole;
+    can_access_private_content?: boolean;
+    /**
+     * When the organization's logo was last set, or null/absent for none. It
+     * says whether there is a logo to fetch, and changes when the logo does.
+     */
+    logo_updated_at?: string | null;
     /** Accepted roster size, so a card can say "N members" without a fetch. */
     member_count?: number;
 }
@@ -1377,11 +1603,13 @@ export interface OrgMemberRow {
     id: string;
     user_id: string;
     role: OrgRole;
+    can_access_private_content?: boolean;
     created_at?: string;
 }
 
 /** Roster row from GET /members: the bare row plus mirrored profile fields. */
 export interface OrgMember extends OrgMemberRow {
+    profile_photo?: string | null;
     email: string | null;
     display_name: string | null;
 }
@@ -1424,6 +1652,16 @@ export async function listOrgs(): Promise<Org[]> {
     return apiRequest<Org[]>("/orgs");
 }
 
+export type { DeletedOrganization } from "@mike/contracts";
+
+export async function listDeletedOrganizations(): Promise<import("@mike/contracts").DeletedOrganization[]> {
+    return apiRequest("/orgs/deleted");
+}
+
+export async function restoreOrganization(orgId: string): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/restore`, { method: "POST" });
+}
+
 export async function createOrg(name: string): Promise<Org> {
     return apiRequest<Org>("/orgs", {
         method: "POST",
@@ -1444,29 +1682,168 @@ export async function updateOrg(orgId: string, name: string): Promise<Org> {
     });
 }
 
+/** Soft-delete an organization for 30 days. Owner only. */
 export async function deleteOrg(orgId: string): Promise<void> {
     await apiRequest(`/orgs/${orgId}`, { method: "DELETE" });
 }
 
-export interface OrgResources {
-    projects: Project[];
-    workflows: {
-        id: string;
-        user_id: string | null;
-        org_id: string;
-        title: string | null;
-        type: "assistant" | "tabular";
-        practice: string | null;
-        created_at: string;
-    }[];
+export type OrgDataKind = "chats" | "tabular-reviews" | "projects" | "memories";
+
+/** Permanently deletes one kind of content across an organization. Owner only. */
+export async function deleteOrgData(
+    orgId: string,
+    kind: OrgDataKind,
+): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/data/${kind}`, { method: "DELETE" });
 }
 
-export async function listOrgResources(orgId: string): Promise<OrgResources> {
-    return apiRequest<OrgResources>(`/orgs/${orgId}/resources`);
+/**
+ * The organization's logo as a data URL, or null when it has none. Shown in
+ * the sidebar in place of the app's logo while its workspace is active.
+ */
+export async function getOrgLogo(orgId: string): Promise<string | null> {
+    try {
+        const logo = await apiRequest<{ data_url: string }>(
+            `/orgs/${orgId}/logo`,
+        );
+        return logo.data_url || null;
+    } catch (error) {
+        if (error instanceof MikeApiError && error.status === 404) return null;
+        throw error;
+    }
+}
+
+/** Set or replace the logo, sent as a PNG, JPEG or WebP data URL. */
+export async function saveOrgLogo(
+    orgId: string,
+    dataUrl: string,
+): Promise<{ logo_updated_at: string }> {
+    return apiRequest<{ logo_updated_at: string }>(`/orgs/${orgId}/logo`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data_url: dataUrl }),
+    });
+}
+
+export async function deleteOrgLogo(orgId: string): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/logo`, { method: "DELETE" });
+}
+
+/**
+ * An organization's model provider keys, as its members see them. Never a
+ * key itself: only which providers are set up.
+ */
+export interface OrgApiKeySettings {
+    /** The organization's own keys. */
+    keys: ApiKeyStatus;
+    /**
+     * What the caller can run in the organization: its keys, with their own
+     * beneath where that is allowed. The model picker reads this.
+     */
+    effective: ApiKeyStatus;
+    /**
+     * The models the organization's key may run, per "model list" provider.
+     * Keyed by router slug; chosen by its owners and admins.
+     */
+    router_models: Record<string, string[]>;
+    /**
+     * The lists that govern the caller's work here: the organization's for
+     * each provider whose key it holds, their own for the rest.
+     */
+    effective_router_models: Record<string, string[]>;
+    /** Whether a member's own key is used where the organization has none. */
+    allow_personal_api_keys: boolean;
+    /** Whether the caller may change any of this (owners and admins). */
+    can_manage: boolean;
+}
+
+export async function getOrgApiKeys(orgId: string): Promise<OrgApiKeySettings> {
+    return apiRequest<OrgApiKeySettings>(`/orgs/${orgId}/api-keys`);
+}
+
+export async function saveOrgApiKey(
+    orgId: string,
+    provider: ApiKeyProvider,
+    apiKey: string | null,
+    settings?: ApiKeySettings[keyof ApiKeySettings],
+): Promise<OrgApiKeySettings> {
+    return apiRequest<OrgApiKeySettings>(
+        `/orgs/${orgId}/api-keys/${provider}`,
+        {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(
+                settings ? { api_key: apiKey, settings } : { api_key: apiKey },
+            ),
+        },
+    );
+}
+
+/** Replace the models the organization's key for one provider may run. */
+export async function saveOrgRouterModels(
+    orgId: string,
+    provider: ApiKeyProvider,
+    modelIds: string[],
+): Promise<OrgApiKeySettings> {
+    return apiRequest<OrgApiKeySettings>(
+        `/orgs/${orgId}/api-keys/${provider}/models`,
+        {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ model_ids: modelIds }),
+        },
+    );
+}
+
+export async function setOrgApiKeyEnabled(
+    orgId: string,
+    provider: ApiKeyProvider,
+    enabled: boolean,
+): Promise<OrgApiKeySettings> {
+    return apiRequest<OrgApiKeySettings>(
+        `/orgs/${orgId}/api-keys/${provider}`,
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled }),
+        },
+    );
+}
+
+export async function setOrgPersonalApiKeysAllowed(
+    orgId: string,
+    allowed: boolean,
+): Promise<OrgApiKeySettings> {
+    return apiRequest<OrgApiKeySettings>(`/orgs/${orgId}/api-keys/policy`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ allow_personal_api_keys: allowed }),
+    });
 }
 
 export async function listOrgMembers(orgId: string): Promise<OrgMember[]> {
     return apiRequest<OrgMember[]>(`/orgs/${orgId}/members`);
+}
+
+export type { OrgPrivateContentItem, OrgPrivateContentKind, OrgPrivateContentPage } from "@mike/contracts";
+
+export async function listOrgPrivateContent(orgId: string, offset = 0, search = "") {
+    const query = new URLSearchParams({ limit: "50", offset: String(offset), search });
+    return apiRequest<import("@mike/contracts").OrgPrivateContentPage>(`/orgs/${orgId}/private-content?${query}`);
+}
+
+export async function setOrgPrivateContentPermission(orgId: string, userId: string, enabled: boolean): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/members/${userId}/private-content-permission`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }),
+    });
+}
+
+export async function openOrgPrivateContent(orgId: string, kind: import("@mike/contracts").OrgPrivateContentKind, itemId: string): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/private-content/${kind}/${itemId}/open`, { method: "POST" });
+}
+
+export async function closeOrgPrivateContent(orgId: string, kind: import("@mike/contracts").OrgPrivateContentKind, itemId: string): Promise<void> {
+    await apiRequest(`/orgs/${orgId}/private-content/${kind}/${itemId}`, { method: "DELETE" });
 }
 
 export async function updateOrgMember(
@@ -1481,12 +1858,65 @@ export async function updateOrgMember(
     });
 }
 
+/** Asked before removing a member, or before leaving (the caller's own id). */
+export async function getOrgMemberHandover(
+    orgId: string,
+    userId: string,
+    departingUserIds?: string[],
+): Promise<OrgMemberHandover> {
+    const query = departingUserIds?.length
+        ? `?${new URLSearchParams({ departing_user_ids: departingUserIds.join(",") })}`
+        : "";
+    return apiRequest<OrgMemberHandover>(
+        `/orgs/${orgId}/members/${userId}/handover${query}`,
+    );
+}
+
+/**
+ * Remove a member, or leave (the caller's own id). `assignTo` names the
+ * member who takes over shared work. If omitted, the server selects a
+ * remaining organization owner. Unshared work is archived for 30 days.
+ */
 export async function removeOrgMember(
     orgId: string,
     userId: string,
+    assignTo?: string,
 ): Promise<void> {
-    await apiRequest(`/orgs/${orgId}/members/${userId}`, {
+    const query = assignTo
+        ? `?${new URLSearchParams({ assign_to: assignTo }).toString()}`
+        : "";
+    await apiRequest(`/orgs/${orgId}/members/${userId}${query}`, {
         method: "DELETE",
+    });
+}
+
+/** Owner-only: private work left by departed members, by departure. */
+export function listOrgDepartures(orgId: string): Promise<OrgDepartureList> {
+    return apiRequest(`/orgs/${orgId}/departures`);
+}
+
+/** Hands archived items to a member, who becomes their owner. */
+export function reassignOrgDepartureArchives(
+    orgId: string,
+    archiveIds: string[],
+    assignTo: string,
+): Promise<OrgDepartureResolution> {
+    return apiRequest(`/orgs/${orgId}/archives/recover`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archive_ids: archiveIds, assign_to: assignTo }),
+    });
+}
+
+/** Permanently deletes archived items with their contents. */
+export function deleteOrgDepartureArchives(
+    orgId: string,
+    archiveIds: string[],
+): Promise<OrgDepartureResolution> {
+    return apiRequest(`/orgs/${orgId}/archives/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archive_ids: archiveIds }),
     });
 }
 
@@ -1501,7 +1931,7 @@ export async function listOrgInvitations(
 export async function createOrgInvitation(
     orgId: string,
     email: string,
-    role: OrgRole,
+    role: InvitableOrgRole,
 ): Promise<OrgInvitation> {
     return apiRequest<OrgInvitation>(`/orgs/${orgId}/invitations`, {
         method: "POST",
@@ -1706,27 +2136,64 @@ interface LibrarySearchResults {
     documentsHasMore: boolean;
 }
 
-function libraryPaginationQuery(pagination?: LibraryPagination): string {
+/**
+ * Which library a call is about. The library is per workspace — a person's
+ * own documents and folders in Personal, and their own in each organization
+ * they belong to — so a call that lists, or files into, one of them names it:
+ * `{ kind, workspace }`, with `workspace` "personal" or an organization id.
+ * A bare kind names no workspace, and is not narrowed.
+ */
+export type LibraryScope =
+    | LibraryKind
+    | { kind: LibraryKind; workspace?: string };
+
+function libraryKindOf(scope: LibraryScope): LibraryKind {
+    return typeof scope === "string" ? scope : scope.kind;
+}
+
+function libraryWorkspaceOf(scope: LibraryScope): string | undefined {
+    return typeof scope === "string" ? undefined : scope.workspace;
+}
+
+/** `org_id` for an upload made in `workspace`: none in Personal. */
+function workspaceOrgId(workspace: string | undefined): string | undefined {
+    return workspace && workspace !== "personal" ? workspace : undefined;
+}
+
+/** A library route, with the scope's workspace on the query string. */
+function libraryUrl(
+    scope: LibraryScope,
+    suffix = "",
+    params: URLSearchParams = new URLSearchParams(),
+): string {
+    const workspace = libraryWorkspaceOf(scope);
+    if (workspace) params.set("workspace", workspace);
+    const qs = params.toString();
+    return `/library/${libraryKindOf(scope)}${suffix}${qs ? `?${qs}` : ""}`;
+}
+
+function libraryPaginationParams(
+    pagination?: LibraryPagination,
+): URLSearchParams {
     const params = new URLSearchParams();
     if (pagination?.limit != null)
         params.set("limit", String(pagination.limit));
     if (pagination?.offset != null)
         params.set("offset", String(pagination.offset));
-    const qs = params.toString();
-    return qs ? `?${qs}` : "";
+    return params;
 }
 
 export async function getLibrary(
-    kind: LibraryKind,
+    kind: LibraryScope,
     pagination?: LibraryPagination,
 ): Promise<LibraryCollection> {
     return apiRequest<LibraryCollection>(
-        `/library/${kind}${libraryPaginationQuery(pagination)}`,
+        libraryUrl(kind, "", libraryPaginationParams(pagination)),
     );
 }
 
 export async function getLibraryFolderChildren(
-    kind: LibraryKind,
+    kind: LibraryScope,
     folderId: string,
     pagination?: LibraryPagination,
 ): Promise<LibraryCollection> {
@@ -1735,27 +2202,25 @@ export async function getLibraryFolderChildren(
         params.set("limit", String(pagination.limit));
     if (pagination?.offset != null)
         params.set("offset", String(pagination.offset));
-    return apiRequest<LibraryCollection>(
-        `/library/${kind}?${params.toString()}`,
-    );
+    return apiRequest<LibraryCollection>(libraryUrl(kind, "", params));
 }
 
 export async function getLibraryFolderPath(
-    kind: LibraryKind,
+    kind: LibraryScope,
     folderId: string,
 ): Promise<{ folders: LibraryFolder[] }> {
     return apiRequest<{ folders: LibraryFolder[] }>(
-        `/library/${kind}/folders/${folderId}`,
+        libraryUrl(kind, `/folders/${folderId}`),
     );
 }
 
 export async function getLibraryLevels(
-    kind: LibraryKind,
+    kind: LibraryScope,
     levels: { parentId: string | null; limit: number }[],
 ): Promise<{
     levels: Array<LibraryCollection & { parentId: string | null }>;
 }> {
-    return apiRequest(`/library/${kind}/levels`, {
+    return apiRequest(libraryUrl(kind, "/levels"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ levels }),
@@ -1763,7 +2228,7 @@ export async function getLibraryLevels(
 }
 
 export async function searchLibraryDocuments(
-    kind: LibraryKind,
+    kind: LibraryScope,
     options: LibrarySearchParams,
 ): Promise<LibrarySearchResults> {
     const params = new URLSearchParams({ view: "search" });
@@ -1774,40 +2239,37 @@ export async function searchLibraryDocuments(
     if (options.sortKey) params.set("sort_key", options.sortKey);
     if (options.sortDirection)
         params.set("sort_direction", options.sortDirection);
-    return apiRequest<LibrarySearchResults>(
-        `/library/${kind}?${params.toString()}`,
-        { signal: options.signal },
-    );
+    return apiRequest<LibrarySearchResults>(libraryUrl(kind, "", params), {
+        signal: options.signal,
+    });
 }
 
 export async function getLibraryFilterOptions(
-    kind: LibraryKind,
+    kind: LibraryScope,
 ): Promise<{ fileTypes: string[] }> {
     return apiRequest<{ fileTypes: string[] }>(
-        `/library/${kind}/filter-options`,
+        libraryUrl(kind, "/filter-options"),
     );
 }
 
 export async function listLibraryDocumentIds(
-    kind: LibraryKind,
+    kind: LibraryScope,
     options?: { search?: string; fileType?: string; signal?: AbortSignal },
 ): Promise<string[]> {
     const params = new URLSearchParams();
     if (options?.search) params.set("search", options.search);
     if (options?.fileType) params.set("file_type", options.fileType);
-    const query = params.toString();
-    return apiRequest<string[]>(
-        `/library/${kind}/ids${query ? `?${query}` : ""}`,
-        { signal: options?.signal },
-    );
+    return apiRequest<string[]>(libraryUrl(kind, "/ids", params), {
+        signal: options?.signal,
+    });
 }
 
 export async function bulkDeleteLibraryDocuments(
-    kind: LibraryKind,
+    kind: LibraryScope,
     ids: string[],
 ): Promise<{ deletedIds: string[] }> {
     return apiRequest<{ deletedIds: string[] }>(
-        `/library/${kind}/documents/bulk-delete`,
+        libraryUrl(kind, "/documents/bulk-delete"),
         {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1817,7 +2279,7 @@ export async function bulkDeleteLibraryDocuments(
 }
 
 export async function uploadLibraryDocument(
-    kind: LibraryKind,
+    kind: LibraryScope,
     file: File,
     folderId?: string | null,
     options?: UploadRequestOptions<Document>,
@@ -1828,7 +2290,7 @@ export async function uploadLibraryDocument(
 }
 
 export async function uploadLibraryDocuments(
-    kind: LibraryKind,
+    kind: LibraryScope,
     files: UploadSessionInput[],
     options?: UploadRequestOptions<Document>,
 ): Promise<UploadOutcome<Document>[]> {
@@ -1836,7 +2298,11 @@ export async function uploadLibraryDocuments(
         purpose: "document_create",
         destination: {
             scope: "library",
-            library_kind: kind === "files" ? "file" : "template",
+            library_kind: libraryKindOf(kind) === "files" ? "file" : "template",
+            // Filed under the workspace it is uploaded in; Personal has none.
+            ...(workspaceOrgId(libraryWorkspaceOf(kind))
+                ? { org_id: workspaceOrgId(libraryWorkspaceOf(kind)) }
+                : {}),
         },
         files,
         onProgress: options?.onProgress,
@@ -1845,11 +2311,11 @@ export async function uploadLibraryDocuments(
 }
 
 export async function createLibraryFolder(
-    kind: LibraryKind,
+    kind: LibraryScope,
     name: string,
     parentFolderId?: string | null,
 ): Promise<LibraryFolder> {
-    return apiRequest<LibraryFolder>(`/library/${kind}/folders`, {
+    return apiRequest<LibraryFolder>(libraryUrl(kind, "/folders"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1860,13 +2326,13 @@ export async function createLibraryFolder(
 }
 
 export async function resolveLibraryFolderPath(
-    kind: LibraryKind,
+    kind: LibraryScope,
     segments: string[],
     baseFolderId: string | null,
     conflictResolution: FolderConflictResolution = "error",
 ): Promise<FolderPathResolution<LibraryFolder>> {
     return apiRequest<FolderPathResolution<LibraryFolder>>(
-        `/library/${kind}/folder-paths/resolve`,
+        libraryUrl(kind, "/folder-paths/resolve"),
         {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1880,45 +2346,51 @@ export async function resolveLibraryFolderPath(
 }
 
 export async function renameLibraryFolder(
-    kind: LibraryKind,
+    kind: LibraryScope,
     folderId: string,
     name: string,
 ): Promise<LibraryFolder> {
-    return apiRequest<LibraryFolder>(`/library/${kind}/folders/${folderId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-    });
+    return apiRequest<LibraryFolder>(
+        libraryUrl(kind, `/folders/${folderId}`),
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+        },
+    );
 }
 
 export async function deleteLibraryFolder(
-    kind: LibraryKind,
+    kind: LibraryScope,
     folderId: string,
 ): Promise<void> {
-    await apiRequest(`/library/${kind}/folders/${folderId}`, {
+    await apiRequest(libraryUrl(kind, `/folders/${folderId}`), {
         method: "DELETE",
     });
 }
 
 export async function moveLibraryFolder(
-    kind: LibraryKind,
+    kind: LibraryScope,
     folderId: string,
     parentFolderId: string | null,
 ): Promise<LibraryFolder> {
-    return apiRequest<LibraryFolder>(`/library/${kind}/folders/${folderId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent_folder_id: parentFolderId }),
-    });
+    return apiRequest<LibraryFolder>(
+        libraryUrl(kind, `/folders/${folderId}`),
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parent_folder_id: parentFolderId }),
+        },
+    );
 }
 
 export async function moveLibraryDocument(
-    kind: LibraryKind,
+    kind: LibraryScope,
     documentId: string,
     folderId: string | null,
 ): Promise<Document> {
     return apiRequest<Document>(
-        `/library/${kind}/documents/${documentId}/folder`,
+        libraryUrl(kind, `/documents/${documentId}/folder`),
         {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -1928,15 +2400,18 @@ export async function moveLibraryDocument(
 }
 
 export async function renameLibraryDocument(
-    kind: LibraryKind,
+    kind: LibraryScope,
     documentId: string,
     filename: string,
 ): Promise<Document> {
-    return apiRequest<Document>(`/library/${kind}/documents/${documentId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename }),
-    });
+    return apiRequest<Document>(
+        libraryUrl(kind, `/documents/${documentId}`),
+        {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename }),
+        },
+    );
 }
 
 export async function addDocumentToProject(
@@ -1958,6 +2433,7 @@ export interface DocumentVersion {
     file_type?: string | null;
     size_bytes?: number | null;
     page_count?: number | null;
+    textless_page_count?: number | null;
     deleted_at?: string | null;
     deleted_by?: string | null;
 }
@@ -2093,28 +2569,38 @@ export async function uploadProjectDocuments(
     });
 }
 
+/**
+ * Upload documents on their own — attached to a chat, outside any project.
+ * `workspace` is the workspace they are uploaded in ("personal" or an
+ * organization id): a document uploaded in an organization's workspace
+ * belongs to that organization.
+ */
 export async function uploadStandaloneDocument(
     file: File,
     options?: UploadRequestOptions<Document>,
+    workspace?: string,
 ): Promise<Document> {
-    return firstUploadResult(await uploadStandaloneDocuments([{ file }], options));
+    return firstUploadResult(
+        await uploadStandaloneDocuments([{ file }], options, workspace),
+    );
 }
 
 export async function uploadStandaloneDocuments(
     files: UploadSessionInput[],
     options?: UploadRequestOptions<Document>,
+    workspace?: string,
 ): Promise<UploadOutcome<Document>[]> {
+    const orgId = workspaceOrgId(workspace);
     return uploadFilesWithSession<Document>({
         purpose: "document_create",
-        destination: { scope: "standalone" },
+        destination: {
+            scope: "standalone",
+            ...(orgId ? { org_id: orgId } : {}),
+        },
         files,
         onProgress: options?.onProgress,
         signal: options?.signal,
     });
-}
-
-export async function listStandaloneDocuments(): Promise<Document[]> {
-    return apiRequest<Document[]>("/single-documents");
 }
 
 export async function getDocument(documentId: string): Promise<Document> {
@@ -2205,6 +2691,11 @@ export async function downloadDocumentsZip(
 
 export async function createChat(payload?: {
     project_id?: string;
+    /**
+     * The organization whose workspace a standalone chat is started in.
+     * Omitted in Personal; not consulted when the chat is in a project.
+     */
+    org_id?: string;
 }): Promise<{ id: string }> {
     return apiRequest<{ id: string }>("/chat/create", {
         method: "POST",
@@ -2218,6 +2709,7 @@ export async function listChats(options?: {
     offset?: number;
     beforeUpdatedAt?: string;
     beforeId?: string;
+    workspace?: string;
 }): Promise<Chat[]> {
     const params = new URLSearchParams();
     if (options?.limit) params.set("limit", String(options.limit));
@@ -2225,6 +2717,7 @@ export async function listChats(options?: {
     if (options?.beforeUpdatedAt)
         params.set("before_updated_at", options.beforeUpdatedAt);
     if (options?.beforeId) params.set("before_id", options.beforeId);
+    if (options?.workspace) params.set("workspace", options.workspace);
     const query = params.toString();
     return apiRequest<Chat[]>(`/chat${query ? `?${query}` : ""}`);
 }
@@ -2390,18 +2883,6 @@ export async function deleteChat(chatId: string): Promise<void> {
     await apiRequest(`/chat/${chatId}`, { method: "DELETE" });
 }
 
-export async function generateChatTitle(
-    chatId: string,
-    message: string,
-    model: string,
-): Promise<{ title: string }> {
-    return apiRequest<{ title: string }>(`/chat/${chatId}/generate-title`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, model }),
-    });
-}
-
 const panelDocumentRequests = new Map<string, Promise<PanelDocument>>();
 
 export async function getPanelDocument(
@@ -2445,6 +2926,11 @@ export async function streamChat(payload: {
     }[];
     chat_id?: string;
     project_id?: string;
+    /**
+     * The organization whose workspace the chat is in. It decides where a
+     * NEW chat is filed; an existing chat keeps the organization it has.
+     */
+    org_id?: string;
     model?: string;
     reasoning?: Message["reasoning"];
     ask_inputs_response?: AskInputsResponsePayload;
@@ -2505,6 +2991,7 @@ export async function listTabularReviews(
         sortKey?: string;
         sortDirection?: "asc" | "desc";
         scope?: "all" | "in-project" | "standalone";
+        workspace?: string;
         signal?: AbortSignal;
     },
 ): Promise<TabularReview[]> {
@@ -2518,6 +3005,7 @@ export async function listTabularReviews(
         params.set("sort_direction", pagination.sortDirection);
     if (pagination?.scope && pagination.scope !== "all")
         params.set("scope", pagination.scope);
+    if (pagination?.workspace) params.set("workspace", pagination.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<TabularReview[]>(`/tabular-review${qs}`, {
@@ -2530,6 +3018,7 @@ export async function listTabularReviewIds(
     options?: {
         search?: string;
         scope?: "all" | "in-project" | "standalone";
+        workspace?: string;
         signal?: AbortSignal;
     },
 ): Promise<{ id: string; user_id: string }[]> {
@@ -2538,6 +3027,7 @@ export async function listTabularReviewIds(
     if (options?.search) params.set("search", options.search);
     if (options?.scope && options.scope !== "all")
         params.set("scope", options.scope);
+    if (options?.workspace) params.set("workspace", options.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<{ id: string; user_id: string }[]>(
@@ -2552,6 +3042,11 @@ export async function createTabularReview(payload: {
     columns_config: { index: number; name: string; prompt: string }[];
     workflow_id?: string;
     project_id?: string;
+    /**
+     * The organization whose workspace a standalone review is started in.
+     * Omitted in Personal; not consulted when the review is in a project.
+     */
+    org_id?: string;
     document_grouping?: "document" | "folder";
     model: string;
 }): Promise<TabularReview> {
@@ -2647,13 +3142,19 @@ export async function uploadReviewDocument(
     file: File,
     options?: {
         projectId?: string;
+        /**
+         * The review's workspace, for a review outside any project: the file
+         * is filed there, because a review takes documents from its own
+         * workspace only.
+         */
+        workspace?: string;
         documentIds?: string[];
         columnsConfig?: { index: number; name: string; prompt: string }[];
     },
 ): Promise<Document> {
     const uploaded = options?.projectId
         ? await uploadProjectDocument(options.projectId, file)
-        : await uploadStandaloneDocument(file);
+        : await uploadStandaloneDocument(file, undefined, options?.workspace);
 
     await updateTabularReview(reviewId, {
         columns_config: options?.columnsConfig,
@@ -2985,11 +3486,19 @@ export async function listWorkflowsPage(pagination?: {
     search?: string;
     sortKey?: string;
     sortDirection?: "asc" | "desc";
-    scope?: "all" | "owned" | "shared" | "private" | "collaborative";
+    scope?:
+        | "all"
+        | "owned"
+        | "shared"
+        | "private"
+        | "collaborative"
+        | "public"
+        | "nonpublic";
     type?: WorkflowType;
     practice?: string;
     language?: string;
     jurisdiction?: string;
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<Workflow[]> {
     const params = new URLSearchParams();
@@ -3006,6 +3515,7 @@ export async function listWorkflowsPage(pagination?: {
     if (pagination?.language) params.set("language", pagination.language);
     if (pagination?.jurisdiction)
         params.set("jurisdiction", pagination.jurisdiction);
+    if (pagination?.workspace) params.set("workspace", pagination.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<Workflow[]>(`/workflows${qs}`, {
@@ -3015,11 +3525,19 @@ export async function listWorkflowsPage(pagination?: {
 
 export async function listWorkflowIds(options?: {
     search?: string;
-    scope?: "all" | "owned" | "shared" | "private" | "collaborative";
+    scope?:
+        | "all"
+        | "owned"
+        | "shared"
+        | "private"
+        | "collaborative"
+        | "public"
+        | "nonpublic";
     type?: WorkflowType;
     practice?: string;
     language?: string;
     jurisdiction?: string;
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<{ id: string; user_id: string }[]> {
     const params = new URLSearchParams();
@@ -3030,6 +3548,7 @@ export async function listWorkflowIds(options?: {
     if (options?.practice) params.set("practice", options.practice);
     if (options?.language) params.set("language", options.language);
     if (options?.jurisdiction) params.set("jurisdiction", options.jurisdiction);
+    if (options?.workspace) params.set("workspace", options.workspace);
 
     const qs = params.toString() ? `?${params.toString()}` : "";
     return apiRequest<{ id: string; user_id: string }[]>(
@@ -3059,12 +3578,14 @@ export interface WorkflowFilterOptions {
 export async function getWorkflowFilterOptions(options?: {
     type?: WorkflowType;
     scope?: "all" | "owned" | "shared";
+    workspace?: string;
     signal?: AbortSignal;
 }): Promise<WorkflowFilterOptions> {
     const params = new URLSearchParams();
     if (options?.type) params.set("type", options.type);
     if (options?.scope && options.scope !== "all")
         params.set("scope", options.scope);
+    if (options?.workspace) params.set("workspace", options.workspace);
     const query = params.toString();
     return apiRequest<WorkflowFilterOptions>(
         `/workflows/filter-options${query ? `?${query}` : ""}`,
@@ -3089,6 +3610,7 @@ export async function createWorkflow(payload: {
     skill_md?: string;
     columns_config?: { index: number; name: string; prompt: string }[];
     org_id?: string;
+    visibility?: ContentVisibility;
 }): Promise<Workflow> {
     return apiRequest<Workflow>("/workflows", {
         method: "POST",
@@ -3108,6 +3630,7 @@ export async function updateWorkflow(
         };
         skill_md?: string;
         columns_config?: { index: number; name: string; prompt: string }[];
+        visibility?: ContentVisibility;
     },
 ): Promise<Workflow> {
     return apiRequest<Workflow>(`/workflows/${workflowId}`, {
@@ -3254,16 +3777,6 @@ export async function copyDocumentsToWorkflowAssets(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ document_ids: documentIds }),
         },
-    );
-}
-
-export async function uploadWorkflowAsset(
-    workflowId: string,
-    file: File,
-    options?: UploadRequestOptions<Document>,
-): Promise<Document> {
-    return firstUploadResult(
-        await uploadWorkflowAssets(workflowId, [{ file }], options),
     );
 }
 

@@ -7,8 +7,9 @@ import {
 } from "../../../../lib/storage";
 import { convertedPdfKey, docxToPdf } from "../../../../lib/convert";
 import { enqueueConversion } from "../../../../lib/queue/conversionQueue";
-import { enqueueDbJob, enqueueStorageCleanup } from "../../../../lib/dbq/enqueue";
+import { enqueueDbJob } from "../../../../lib/dbq/enqueue";
 import type { Db } from "../../../../lib/supabase";
+import { can, ensureDocAccess } from "../../../../lib/access";
 import { profileAttributionName } from "../../../../lib/userLookup";
 import {
   applyTrackedEdits,
@@ -60,7 +61,10 @@ export function citationReminder(
 }
 
 export { extractPdfText, extractLegacyOfficeText } from "../../../../lib/pdfText";
-import { extractPdfText, extractLegacyOfficeText } from "../../../../lib/pdfText";
+import {
+  extractPdfTextForModel,
+  extractLegacyOfficeText,
+} from "../../../../lib/pdfText";
 
 export async function generateDocx(
   title: string,
@@ -71,6 +75,8 @@ export async function generateDocx(
     landscape?: boolean;
     numberSections?: boolean;
     projectId?: string | null;
+    /** The conversation's organization: where a standalone document is filed. */
+    orgId?: string | null;
   },
 ) {
   try {
@@ -517,6 +523,7 @@ export async function generateDocx(
       userId,
       db,
       projectId: options?.projectId ?? null,
+      orgId: options?.orgId ?? null,
     });
   } catch (e) {
     return { error: String(e) };
@@ -915,8 +922,14 @@ async function persistGeneratedFile(params: {
   userId: string;
   db: Db;
   projectId?: string | null;
+  /**
+   * The organization of the conversation it was generated in. A document
+   * made in an organization's workspace belongs to that organization; inside
+   * a project the project's organization is stamped by the database.
+   */
+  orgId?: string | null;
 }) {
-  const { title, extension, buffer, userId, db, projectId } = params;
+  const { title, extension, buffer, userId, db, projectId, orgId } = params;
   const docId = crypto.randomUUID().replace(/-/g, "");
   const filename = safeGeneratedFilename(title, extension);
   const key = generatedDocKey(userId, docId, filename);
@@ -962,6 +975,7 @@ async function persistGeneratedFile(params: {
     .from("documents")
     .insert({
       project_id: projectId ?? null,
+      org_id: orgId ?? null,
       user_id: userId,
       status: "ready",
     })
@@ -1032,7 +1046,7 @@ export async function generateExcel(
   sheets: unknown[],
   userId: string,
   db: Db,
-  options?: { projectId?: string | null },
+  options?: { projectId?: string | null; orgId?: string | null },
 ) {
   try {
     const normalizedTitle = typeof title === "string" ? title : "Workbook";
@@ -1047,6 +1061,7 @@ export async function generateExcel(
       userId,
       db,
       projectId: options?.projectId ?? null,
+      orgId: options?.orgId ?? null,
     });
   } catch (e) {
     return { error: String(e) };
@@ -1058,7 +1073,7 @@ export async function generatePpt(
   slides: unknown[],
   userId: string,
   db: Db,
-  options?: { projectId?: string | null },
+  options?: { projectId?: string | null; orgId?: string | null },
 ) {
   try {
     const normalizedTitle = typeof title === "string" ? title : "Presentation";
@@ -1073,6 +1088,7 @@ export async function generatePpt(
       userId,
       db,
       projectId: options?.projectId ?? null,
+      orgId: options?.orgId ?? null,
     });
   } catch (e) {
     return { error: String(e) };
@@ -1107,6 +1123,12 @@ export async function loadCurrentVersionBytes(
 export async function runEditDocument(params: {
   documentId: string;
   userId: string;
+  /**
+   * The caller's authenticated email, needed to resolve direct (email-keyed)
+   * grants in the write check below. Without it only creator and
+   * organization access count, which fails closed.
+   */
+  userEmail?: string | null;
   edits: EditInput[];
   db: Db;
   /**
@@ -1133,14 +1155,40 @@ export async function runEditDocument(params: {
     }
   | { ok: false; error: string }
 > {
-  const { documentId, userId, edits, db, reuseVersion } = params;
+  const { documentId, userId, userEmail, edits, db, reuseVersion } = params;
 
   const { data: doc } = await db
     .from("documents")
-    .select("id")
+    .select("id, user_id, project_id, org_id, workflow_id")
     .eq("id", documentId)
     .single();
   if (!doc) return { ok: false, error: "Document not found." };
+
+  // The write is authorized against THIS document, not the turn. Whether a
+  // turn may write at all (`allowDocumentMutation`) is decided from the
+  // chat's container, but the chat's attachments can come from anywhere the
+  // caller can read — a standalone chat, or a project chat that attached a
+  // document from another project. Reading is not editing: a Viewer on the
+  // document's project must not get a new active version through the
+  // assistant when the version routes would refuse them.
+  const access = await ensureDocAccess(
+    doc as {
+      user_id: string | null;
+      project_id: string | null;
+      org_id?: string | null;
+      workflow_id?: string | null;
+    },
+    userId,
+    userEmail,
+    db,
+  );
+  if (!access.ok) return { ok: false, error: "Document not found." };
+  if (!can(access.projectRole, "content.edit"))
+    return {
+      ok: false,
+      error:
+        "You do not have permission to edit this document. Use replicate_document to make an editable copy instead.",
+    };
 
   const activeVersion = await loadActiveVersion(documentId, db);
   let versionFilename =
@@ -1517,7 +1565,7 @@ export async function readDocumentContent(
     let text: string;
     const fileType = docInfo.file_type?.toLowerCase?.() ?? "";
     if (fileType === "pdf") {
-      text = await extractPdfText(raw);
+      text = await extractPdfTextForModel(raw);
       devLog(
         `[read_document] pdf extracted length=${text.length} for filename="${docInfo.filename}"`,
       );

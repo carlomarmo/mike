@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
+import {
+    checkProjectAccess,
+    checkWorkflowAccess,
+    ensureChatAccess,
+    ensureDocAccess,
+    ensureReviewAccess,
+} from "../../lib/access";
+import { mapWithConcurrency } from "../../lib/concurrency";
 import { sealManifest } from "../../lib/manifestSigning";
 import { type Db } from "../../lib/supabase";
+import { throwIfError, uniqueStrings } from "./user.shared";
 
 const PAGE_SIZE = 1000;
 
@@ -13,17 +22,6 @@ export function userExportFilename(
     userId: string,
 ) {
     return `mike-${kind}-export-${userId.slice(0, 8)}-${nowStamp()}.json`;
-}
-
-function uniqueStrings(values: Array<string | null | undefined>): string[] {
-    return [...new Set(values.filter((value): value is string => !!value))];
-}
-
-async function throwIfError<T extends { message?: string } | null>(
-    error: T,
-    context: string,
-) {
-    if (error) throw new Error(`${context}: ${error.message ?? "unknown error"}`);
 }
 
 async function selectAll(
@@ -67,6 +65,41 @@ function idsFrom(rows: Record<string, unknown>[], column = "id"): string[] {
         rows.map((row) =>
             typeof row[column] === "string" ? (row[column] as string) : null,
         ),
+    );
+}
+
+type ExportResourceRow = Record<string, unknown> & {
+    id: string;
+    user_id: string | null;
+    project_id: string | null;
+    org_id?: string | null;
+    workflow_id?: string | null;
+    archived_at?: string | null;
+};
+
+/**
+ * Export jobs use the service-role client. Creator provenance only chooses
+ * candidates; normal read permissions decide which content may leave the app.
+ * Check at build time, since membership or sharing may change while queued.
+ */
+async function readableRows(
+    rows: Record<string, unknown>[],
+    authorize: (row: ExportResourceRow) => Promise<{ ok: boolean }>,
+): Promise<Record<string, unknown>[]> {
+    const allowed = await mapWithConcurrency(rows, 8, async (row) =>
+        typeof row.id === "string" && !row.archived_at
+            ? (await authorize(row as ExportResourceRow)).ok
+            : false,
+    );
+    return rows.filter((_, index) => allowed[index]);
+}
+
+async function loadUserReviews(db: Db, userId: string, userEmail?: string | null) {
+    const reviews = await selectAll(db, "tabular_reviews", (query) =>
+        query.eq("user_id", userId).order("created_at", { ascending: true }),
+    );
+    return readableRows(reviews, (row) =>
+        ensureReviewAccess(row, userId, userEmail, db),
     );
 }
 
@@ -131,9 +164,12 @@ async function loadMemoryExport(
     };
 }
 
-async function loadUserChats(db: Db, userId: string) {
-    const chats = await selectAll(db, "chats", (query) =>
+async function loadUserChats(db: Db, userId: string, userEmail?: string | null) {
+    const candidates = await selectAll(db, "chats", (query) =>
         query.eq("user_id", userId).order("created_at", { ascending: true }),
+    );
+    const chats = await readableRows(candidates, (row) =>
+        ensureChatAccess(row, userId, userEmail, db),
     );
     const chatIds = idsFrom(chats);
     const messages = await selectByIds(db, "chat_messages", "chat_id", chatIds);
@@ -156,9 +192,28 @@ async function loadUserWordChats(db: Db, userId: string) {
     return { documents, chats, messages };
 }
 
-async function loadUserTabularChats(db: Db, userId: string) {
-    const chats = await selectAll(db, "tabular_review_chats", (query) =>
+async function loadUserTabularChats(
+    db: Db,
+    userId: string,
+    userEmail?: string | null,
+) {
+    const candidates = await selectAll(db, "tabular_review_chats", (query) =>
         query.eq("user_id", userId).order("created_at", { ascending: true }),
+    );
+    // A review chat retains its creator after that person leaves the team.
+    // Its parent review, not that creator id, controls access to the transcript.
+    const reviews = await selectByIds(
+        db,
+        "tabular_reviews",
+        "id",
+        idsFrom(candidates, "review_id"),
+    );
+    const readableReviews = await readableRows(reviews, (row) =>
+        ensureReviewAccess(row, userId, userEmail, db),
+    );
+    const reviewIds = new Set(idsFrom(readableReviews));
+    const chats = candidates.filter(
+        (chat) => typeof chat.review_id === "string" && reviewIds.has(chat.review_id),
     );
     const chatIds = idsFrom(chats);
     const messages = await selectByIds(
@@ -175,11 +230,17 @@ async function loadApiKeyStatus(db: Db, userId: string) {
         query
             .eq("user_id", userId)
             .order("provider", { ascending: true }),
-        "provider, created_at, updated_at",
+        // Never the key material (encrypted_key, iv, auth_tag): only what
+        // the user can already see in Settings.
+        "provider, settings, enabled, created_at, updated_at",
     );
     return rows.map((row) => ({
         provider: row.provider,
         has_key: true,
+        // A disabled provider keeps its key; enabled defaults to true.
+        enabled: row.enabled !== false,
+        // The non-secret region/endpoint/location/base URL saved with it.
+        settings: row.settings ?? null,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }));
@@ -191,9 +252,9 @@ export async function buildUserChatsExport(
     userEmail?: string | null,
 ) {
     const [assistant, wordAddin, tabular] = await Promise.all([
-        loadUserChats(db, userId),
+        loadUserChats(db, userId, userEmail),
         loadUserWordChats(db, userId),
-        loadUserTabularChats(db, userId),
+        loadUserTabularChats(db, userId, userEmail),
     ]);
 
     return {
@@ -210,9 +271,7 @@ export async function buildUserTabularReviewsExport(
     userId: string,
     userEmail?: string | null,
 ) {
-    const tabularReviews = await selectAll(db, "tabular_reviews", (query) =>
-        query.eq("user_id", userId).order("created_at", { ascending: true }),
-    );
+    const tabularReviews = await loadUserReviews(db, userId, userEmail);
     const reviewIds = idsFrom(tabularReviews);
 
     const [cells, chats] = await Promise.all([
@@ -387,6 +446,10 @@ export async function buildUserAccountExport(
         ),
         selectAll(db, "projects", (query) =>
             query.eq("user_id", userId).order("created_at", { ascending: true }),
+        ).then((rows) =>
+            readableRows(rows, (row) =>
+                checkProjectAccess(row.id, userId, userEmail, db),
+            ),
         ),
         selectAll(db, "documents", (query) =>
             query
@@ -396,6 +459,10 @@ export async function buildUserAccountExport(
         ),
         selectAll(db, "workflows", (query) =>
             query.eq("user_id", userId).order("created_at", { ascending: true }),
+        ).then((rows) =>
+            readableRows(rows, (row) =>
+                checkWorkflowAccess(row.id, userId, userEmail, db),
+            ),
         ),
         selectAll(db, "default_workflow_installations", (query) =>
             query.eq("user_id", userId).order("installed_at", { ascending: true }),
@@ -423,15 +490,13 @@ export async function buildUserAccountExport(
                       .order("created_at", { ascending: true }),
               )
             : Promise.resolve([]),
-        loadUserChats(db, userId),
-        loadUserTabularChats(db, userId),
-        selectAll(db, "tabular_reviews", (query) =>
-            query.eq("user_id", userId).order("created_at", { ascending: true }),
-        ),
+        loadUserChats(db, userId, userEmail),
+        loadUserTabularChats(db, userId, userEmail),
+        loadUserReviews(db, userId, userEmail),
         userEmail
             ? (async () => {
-                  // Shared projects come from the grant table so the export
-                  // lists exactly the projects the caller can actually reach.
+                  // Grants are candidates too: stale grants cannot override
+                  // current organization membership or resource permissions.
                   const grantRows = await selectAll(
                       db,
                       "project_access_grants",
@@ -456,6 +521,10 @@ export async function buildUserAccountExport(
                           .neq("user_id", userId)
                           .order("created_at", { ascending: true }),
                       "id, user_id, name, cm_number, created_at, updated_at",
+                  ).then((rows) =>
+                      readableRows(rows, (row) =>
+                          checkProjectAccess(row.id, userId, userEmail, db),
+                      ),
                   );
               })()
             : Promise.resolve([]),
@@ -487,8 +556,15 @@ export async function buildUserAccountExport(
                           .in("id", reviewIds)
                           .neq("user_id", userId)
                           .order("created_at", { ascending: true }),
-                      "id, user_id, project_id, title, practice, created_at, updated_at",
-                  );
+                      "id, user_id, project_id, org_id, archived_at, title, practice, created_at, updated_at",
+                  ).then(async (rows) => {
+                      const readable = await readableRows(rows, (row) =>
+                          ensureReviewAccess(row, userId, userEmail, db),
+                      );
+                      return readable.map(
+                          ({ org_id: _org, archived_at: _archive, ...row }) => row,
+                      );
+                  });
               })()
             : Promise.resolve([]),
         selectAll(db, "audit_events", (query) =>
@@ -524,7 +600,10 @@ export async function buildUserAccountExport(
         "project_id",
         projectIds,
     );
-    const documents = [...standaloneDocuments, ...projectDocuments];
+    const documents = await readableRows(
+        [...standaloneDocuments, ...projectDocuments],
+        (row) => ensureDocAccess(row, userId, userEmail, db),
+    );
     const documentIds = idsFrom(documents);
     const reviewIds = idsFrom(tabularReviews);
 

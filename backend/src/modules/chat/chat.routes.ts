@@ -1,9 +1,11 @@
+import { abortable } from "../../lib/abortable";
 import {
     attachAssistantTurnSse,
     getActiveAssistantTurn,
     getAssistantTurnRun,
     startAssistantTurnRun,
 } from "../../lib/assistantTurnRuns";
+import { stopOutcomeFrame } from "../../lib/streamRuns";
 // HTTP layer for the chat module.
 //
 // Route handlers parse params/query/body, call the chat.service functions,
@@ -22,8 +24,7 @@ import {
     appendAssistantEventsToMessage,
     AssistantStreamError,
     assistantStreamErrorPayload,
-    ASSISTANT_ERROR_MESSAGE,
-    buildCancelledAssistantMessage,
+    buildStoppedAssistantMessage,
     extractCitations,
     isAbortError,
     isMeaningfulTextlessAssistantOutput,
@@ -41,6 +42,7 @@ import {
     reserveAssistantMessage,
 } from "./engine/index";
 import { normalizeEmail } from "../../lib/access";
+import { teamOrgIdOf } from "../../lib/personalOrgs";
 import { can } from "../../lib/permissions";
 import { generateAssistantChatTitle, logChatTitleFailure } from "./chat.title";
 import { sendInternalError } from "../../lib/httpError";
@@ -53,7 +55,6 @@ import {
     createChat,
     deleteChat,
     devLog,
-    generateChatTitle,
     getAccessibleChat,
     getChatMessages,
     grantChatAccess,
@@ -65,6 +66,10 @@ import {
     updateChatSettings,
     updateChatTitle,
 } from "./chat.service";
+import {
+    resolveWorkspaceFilter,
+    sendWorkspaceFailure,
+} from "../../lib/workspace";
 
 export const chatRouter = Router();
 
@@ -108,6 +113,13 @@ chatRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
         return void res.status(400).json({ detail: "Invalid chat cursor" });
     }
 
+    const workspace = await resolveWorkspaceFilter(
+        db,
+        userId,
+        req.query.workspace,
+    );
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+
     const result = await listChats(db, {
         userId,
         userEmail,
@@ -115,6 +127,7 @@ chatRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
         offset,
         beforeUpdatedAt,
         beforeId,
+        workspace: workspace.workspace,
     });
     if (!result.ok) return void sendInternalError(res, result.error);
     res.json(result.data);
@@ -131,7 +144,12 @@ chatRouter.post("/create", requireAuth, asyncRoute(async (req, res) => {
     const projectId = parsedProjectId.value.projectId;
     const db = createServerSupabase();
 
-    const result = await createChat(db, { userId, userEmail, projectId });
+    const result = await createChat(db, {
+        userId,
+        userEmail,
+        projectId,
+        orgId: req.body?.org_id,
+    });
     if (!result.ok) {
         if (result.kind === "error")
             return void sendInternalError(res, result.error);
@@ -270,7 +288,9 @@ chatRouter.get("/:chatId/access", requireAuth, asyncRoute(async (req, res) => {
     if (!listed.ok) return void sendInternalError(res, listed.detail);
     res.json({
         scope: "direct",
-        org_id: null,
+        // The organization whose members it can be shared with, or null for
+        // a personal chat, which can be shared with anyone.
+        org_id: await teamOrgIdOf(db, access.chat.org_id),
         access_role: access.projectRole,
         grants: listed.grants,
     });
@@ -399,8 +419,8 @@ chatRouter.patch("/:chatId", requireAuth, asyncRoute(async (req, res) => {
     const access = await getAccessibleChat(db, { chatId, userId, userEmail });
     if (!access.ok)
         return void res.status(404).json({ detail: "Chat not found" });
-    // Title edits are content collaboration (the same tier that already
-    // rewrites titles via generate-title).
+    // Title edits are content collaboration (the same tier that may send
+    // messages into the chat).
     if (title != null && !can(access.projectRole, "content.edit"))
         return void res
             .status(403)
@@ -414,6 +434,7 @@ chatRouter.patch("/:chatId", requireAuth, asyncRoute(async (req, res) => {
         chatId,
         userId,
         chatModel: access.chat.model,
+        orgId: access.chat.org_id ?? null,
         ...(title !== undefined ? { title } : {}),
         ...(hasModel
             ? {
@@ -458,50 +479,6 @@ chatRouter.delete("/:chatId", requireAuth, asyncRoute(async (req, res) => {
     const result = await deleteChat(db, { chatId });
     if (!result.ok) return void sendInternalError(res, result.error);
     res.status(204).send();
-}));
-
-// POST /chat/:chatId/generate-title
-chatRouter.post("/:chatId/generate-title", requireAuth, asyncRoute(async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { chatId } = req.params;
-    const message =
-        typeof req.body?.message === "string" ? req.body.message.trim() : "";
-    const requestedModel =
-        typeof req.body?.model === "string" ? req.body.model.trim() : null;
-    if (!message)
-        return void res.status(400).json({ detail: "message is required" });
-    const db = createServerSupabase();
-    const access = await getAccessibleChat(db, { chatId, userId, userEmail });
-    if (!access.ok)
-        return void res.status(404).json({ detail: "Chat not found" });
-    // Generating a title UPDATEs the chat row — a write, so being able to
-    // *see* the chat is not enough. Org viewers get 403 here.
-    if (!can(access.projectRole, "content.edit"))
-        return void res
-            .status(403)
-            .json({ detail: "You do not have permission to modify this chat" });
-
-    const result = await generateChatTitle(db, {
-        chatId,
-        userId,
-        chatModel: access.chat.model,
-        message,
-        requestedModel,
-    });
-    if (!result.ok) {
-        if (result.kind === "model")
-            return void res
-                .status(result.status)
-                .json({ code: result.code, detail: result.detail });
-        // A title that could not be stored is not a renamed chat.
-        if (result.kind === "write")
-            return void sendInternalError(res, result.error);
-        return void res
-            .status(500)
-            .json({ detail: "Failed to generate title" });
-    }
-    res.json({ title: result.title });
 }));
 
 // POST /chat — streaming
@@ -572,6 +549,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         requestedModel: model,
         requestedReasoning: parsedReasoning.value,
         requestedTimeZone: req.body?.time_zone,
+        requestedOrgId: req.body?.org_id,
     });
     if (!prep.ok) {
         if ("internal" in prep) return void sendInternalError(res, prep.error);
@@ -596,6 +574,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         workflowStore,
         legalResearchUs,
         apiKeys,
+        orgId,
         titleModel,
         selectedModel,
         selectedReasoningLevel,
@@ -699,11 +678,13 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 : "";
             titlePromise = shouldGenerateTitle
                 ? generateAssistantChatTitle({
+                      abortSignal: stream.signal,
                       model: titleModelForChat(selectedModel, titleModel),
                       message: titleMessage,
                       apiKeys,
                   })
                       .then(async (title) => {
+                          if (stream.signal.aborted) return;
                           const saved = await updateChatTitle(db, {
                               chatId,
                               title,
@@ -719,15 +700,17 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                       .catch((error) => {
                           // Decided once the reply has settled: see the
                           // logChatTitleFailure calls below.
-                          titleOutcome.failure = { error };
+                          if (!stream.signal.aborted) titleOutcome.failure = { error };
                       })
                 : Promise.resolve();
 
             const { fullText, events, citations } = await runLLMStream({
+                onActivity: run?.touch,
                 apiMessages,
                 docStore,
                 docIndex,
                 userId,
+                userEmail,
                 db,
                 write,
                 allowDocumentMutation,
@@ -736,6 +719,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 model: selectedModel,
                 reasoning: selectedReasoningLevel,
                 apiKeys,
+                orgId,
                 signal: stream.signal,
                 projectId: resolvedProjectId,
                 conversationId: chatId,
@@ -810,7 +794,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 }
             }
 
-            await titlePromise;
+            await abortable(titlePromise, stream.signal).catch(() => {});
             if (titleOutcome.failure) {
                 logChatTitleFailure(
                     "[chat/stream] failed to generate chat title",
@@ -876,6 +860,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 db,
                 {
                     userId,
+                    orgId,
                     userEmail,
                     chatId,
                     projectId: resolvedProjectId,
@@ -889,7 +874,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         } catch (err) {
             // The title ran in parallel with the reply; only now is it known
             // whether its failure is the reply's failure seen twice.
-            await titlePromise;
+            await abortable(titlePromise, stream.signal).catch(() => {});
             if (titleOutcome.failure) {
                 logChatTitleFailure(
                     "[chat/stream] failed to generate chat title",
@@ -903,17 +888,19 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                     db,
                     {
                         userId,
+                    orgId,
                         userEmail,
                         chatId,
                         projectId: resolvedProjectId,
                         title: chatTitle,
                         model: selectedModel,
-                        status: "cancelled",
+                        status: run?.stopReason && run.stopReason !== "user" ? "failed" : "cancelled",
                     },
                     null,
                 );
                 if (err instanceof AssistantStreamError) {
-                    const partial = buildCancelledAssistantMessage({
+                    const partial = buildStoppedAssistantMessage({
+                        stopReason: run?.stopReason,
                         fullText: err.fullText,
                         events: err.events,
                         buildCitations: (fullText) =>
@@ -946,8 +933,8 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 }
                 // Readers still attached (Stop came from another tab, or
                 // this one is watching) learn the outcome the same way a
-                // reload would: the stored row ends "Cancelled by user."
-                write(`data: ${JSON.stringify({ type: "cancelled" })}\n\n`);
+                // reload would: persistence uses the same stop reason.
+                write(stopOutcomeFrame(run));
                 write("data: [DONE]\n\n");
                 return;
             }

@@ -41,11 +41,10 @@ import {
 } from "../user/user.service";
 import {
     resolveEffectiveChatModel,
-    resolveEffectiveReasoningLevel,
     titleModelForChat,
 } from "../../lib/modelSelection";
 import { generateChatTitle } from "./tabular.extract";
-import { loadReviewRows } from "./tabular.rows";
+import { filterReadableReviewRows, loadReviewRows } from "./tabular.rows";
 import {
     parseCellContent,
     statusFailure,
@@ -250,7 +249,7 @@ export async function ensureReviewChatWriteAccess(
     chatId: string,
     userId: string,
     userEmail: string | null | undefined,
-): Promise<{ ok: true } | ServiceFailure> {
+): Promise<{ ok: true; orgId: string | null } | ServiceFailure> {
     const { data: review } = await db
         .from("tabular_reviews")
         .select("id, user_id, project_id, org_id")
@@ -294,7 +293,12 @@ export async function ensureReviewChatWriteAccess(
         )
     )
         return failure("forbidden", "Only the chat's creator can modify it");
-    return { ok: true };
+    // The review's organization rides along: a model change is judged
+    // against the keys the review runs on.
+    return {
+        ok: true,
+        orgId: (review as { org_id?: string | null }).org_id ?? null,
+    };
 }
 
 export async function deleteTabularReviewChat(
@@ -387,7 +391,9 @@ export async function updateTabularReviewChat(
 
     let selectedModel: string | undefined;
     if (hasModel) {
-        const settings = await getUserModelSettings(userId, db);
+        const settings = await getUserModelSettings(userId, db, {
+            orgId: gate.orgId,
+        });
         const resolution = await resolveEffectiveChatModel({
             requested: parsedModel.ok ? parsedModel.value : undefined,
             chatModel: chat.model,
@@ -395,6 +401,7 @@ export async function updateTabularReviewChat(
             apiKeys: settings.api_keys,
             userId,
             db,
+            orgId: gate.orgId,
         });
         if (!resolution.ok)
             return statusFailure(resolution.status, {
@@ -487,6 +494,8 @@ export type PreparedTabularChat = {
     /** The model that names a new chat, already resolved for this chat model. */
     titleModel: string;
     apiKeys: UserApiKeys;
+    /** The review's organization, whose keys and model lists apply. */
+    orgId: string | null;
     apiMessages: unknown[];
     /** The id of the user turn just persisted — the assistant row links back
      *  to it through `memory_input_message_id`. */
@@ -589,12 +598,25 @@ export async function prepareTabularChat(
         return internalFailure(audienceError);
     }
 
-    // Fetch all cells and logical review rows for this review.
-    const { data: cells } = await db
+    // Fetch all cells and logical review rows for this review, narrowed to
+    // the rows whose source documents the caller can read: the model answers
+    // the caller, so it must not be handed filenames or extracted text the
+    // caller could not open themselves (see filterReadableReviewRows).
+    const { data: allCells } = await db
         .from("tabular_cells")
         .select("*")
         .eq("review_id", reviewId);
-    const rows = await loadReviewRows(db, reviewId);
+    const { rows } = await filterReadableReviewRows(
+        db,
+        await loadReviewRows(db, reviewId),
+        [],
+        userId,
+        userEmail,
+    );
+    const visibleRowIds = new Set(rows.map((row) => row.id));
+    const cells = (allCells ?? []).filter((c: { row_id?: string }) =>
+        visibleRowIds.has(c.row_id as string),
+    );
 
     const sortedColumns = (
         (review.columns_config ?? []) as { index: number; name: string }[]
@@ -649,6 +671,7 @@ export async function prepareTabularChat(
         chatReasoningLevel,
         requestedModel,
         requestedReasoning,
+        orgId: review.org_id ?? null,
     });
     if (!selection.ok)
         return statusFailure(selection.status, {
@@ -754,6 +777,7 @@ export async function prepareTabularChat(
                 modelSettings.title_model,
             ),
             apiKeys: modelSettings.api_keys,
+            orgId: review.org_id ?? null,
             apiMessages,
             inputMessageId,
             readableMemoryProjectId,

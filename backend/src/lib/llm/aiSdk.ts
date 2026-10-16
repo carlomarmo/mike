@@ -1,8 +1,10 @@
+import { normalizeReasoningLevelForModel } from "./models";
 import type { LanguageModel, ToolSet } from "ai" with {
   "resolution-mode": "import",
 };
 import type * as AiSdk from "ai" with { "resolution-mode": "import" };
 import type {
+  LlmMessage,
   NormalizedToolCall,
   NormalizedToolResult,
   OpenAIToolSchema,
@@ -10,7 +12,8 @@ import type {
   StreamChatParams,
   StreamChatResult,
 } from "./types";
-import { toProviderStreamError } from "./providerErrors";
+import { providerDeadlines } from "./providerDeadlines";
+import { asProviderStallError, streamErrorMessage, toProviderStreamError } from "./providerErrors";
 import { createRawLlmStreamRecorder, logRawLlmStream } from "./rawStreamLog";
 
 /**
@@ -25,11 +28,18 @@ import { createRawLlmStreamRecorder, logRawLlmStream } from "./rawStreamLog";
  * OpenCode Go keeps the previous 16,384: its Messages models (MiniMax, Qwen)
  * go through the Anthropic adapter, which does not recognise them and would
  * otherwise fall back to 4,096.
+ *
+ * `adapterDefault` is an adapter's own model-aware ceiling for SDKs that do
+ * not fill one in (Bedrock sends no maxTokens unless given one, so Bedrock's
+ * small server default would apply); see AiSdkAdapterConfig.
  */
-export function maxOutputTokensFor(provider: Provider): number | undefined {
+export function maxOutputTokensFor(
+  provider: Provider,
+  adapterDefault?: number,
+): number | undefined {
   const value = Number(process.env.LLM_MAX_OUTPUT_TOKENS);
   if (Number.isSafeInteger(value) && value > 0) return value;
-  return provider === "opencode-go" ? 16_384 : undefined;
+  return provider === "opencode-go" ? 16_384 : adapterDefault;
 }
 
 /**
@@ -67,12 +77,17 @@ export function stopNotice(
   return "";
 }
 
-/** Ensure a proxy-closed final SSE event is still visible to SDK parsers. */
+/**
+ * Ensure a proxy-closed final SSE event is still visible to SDK parsers.
+ * `baseFetch` replaces the global fetch for endpoints that need guarded
+ * egress (a user-supplied base URL).
+ */
 export async function aiSdkFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
+  baseFetch?: typeof fetch,
 ): Promise<Response> {
-  const response = await fetch(input, init);
+  const response = await (baseFetch ?? fetch)(input, init);
   if (
     !response.body ||
     !response.headers.get("content-type")?.includes("text/event-stream")
@@ -196,12 +211,23 @@ Do not use doc_id, page, top-level quote, case_name, or citation fields for Cour
 export type AiSdkAdapterConfig = {
   provider: Provider;
   label: string;
-  model: LanguageModel;
+  model: Exclude<LanguageModel, string>;
   modelId: string;
   /** Some protocol-compatible gateways reject reasoning request fields. */
   supportsReasoning?: boolean;
   /** OpenAI's CourtListener tools require an extra instruction after use. */
   courtlistenerCitationReminder?: boolean;
+  /** Send stored reasoning on earlier assistant turns; see ConfiguredModel. */
+  replayReasoning?: boolean;
+  /** Mark the prefix-cache breakpoint with a Bedrock cache point as well. */
+  bedrockCachePoint?: boolean;
+  /**
+   * Output ceiling for a chat step at the given reasoning level, for SDKs
+   * that send none by default. LLM_MAX_OUTPUT_TOKENS still wins.
+   */
+  defaultMaxOutputTokens?: (
+    reasoning: StreamChatParams["reasoning"],
+  ) => number | undefined;
 };
 
 type PendingToolExecution = {
@@ -311,19 +337,13 @@ function toAiSdkTools(
   );
 }
 
-function errorMessage(error: unknown, label: string): string {
-  if (error instanceof Error && error.message) return error.message;
-  if (typeof error === "string" && error.trim()) return error;
-  return `${label} stream failed.`;
-}
-
 /**
  * The ORIGINAL Error instance from a `tool-error` / `error` part. Re-wrapping
  * it discards error identity, including control-flow and user-facing error
  * types thrown inside runTools (the SDK's tool `execute`).
  */
 function rethrowable(error: unknown, label: string): Error {
-  return error instanceof Error ? error : new Error(errorMessage(error, label));
+  return error instanceof Error ? error : new Error(streamErrorMessage(error, label));
 }
 
 function usesCourtlistenerTool(
@@ -346,24 +366,64 @@ function usesCourtlistenerTool(
  * covers the system prompt, tool definitions, and every earlier turn, and
  * the next request hits that prefix as long as it is byte-identical.
  * Providers ignore namespaces they do not own, so both hints are sent.
+ * Azure OpenAI reads the OpenAI hint from its own `azure` namespace. Bedrock
+ * caches at an explicit cache point too, but most Bedrock models reject one,
+ * so that marker is added only when the adapter asks for it.
  */
 type StreamTextProviderOptions = NonNullable<
   Parameters<typeof AiSdk.streamText>[0]["providerOptions"]
 >;
 
-export function withPrefixCacheHints(params: StreamChatParams): {
+/**
+ * An earlier assistant turn's reasoning becomes a reasoning part ahead of its
+ * text, which the OpenAI-compatible adapter sends as `reasoning_content`.
+ * Without `replay` the stored reasoning is dropped, so no other provider ever
+ * receives it.
+ */
+function toModelMessage(
+  message: LlmMessage,
+  replay: boolean,
+): AiSdk.UserModelMessage | AiSdk.AssistantModelMessage {
+  if (message.role === "user") {
+    return { role: "user", content: message.content };
+  }
+  if (!replay || !message.reasoning) {
+    return { role: "assistant", content: message.content };
+  }
+  return {
+    role: "assistant",
+    content: [
+      { type: "reasoning", text: message.reasoning },
+      { type: "text", text: message.content },
+    ],
+  };
+}
+
+export function withPrefixCacheHints(
+  params: StreamChatParams,
+  options: { replayReasoning?: boolean; bedrockCachePoint?: boolean } = {},
+): {
   messages: AiSdk.ModelMessage[];
   providerOptions?: StreamTextProviderOptions;
 } {
-  if (!params.conversationId || !params.messages.length) {
-    return { messages: params.messages };
+  const messages: (AiSdk.UserModelMessage | AiSdk.AssistantModelMessage)[] =
+    params.messages.some((m) => m.reasoning !== undefined)
+      ? params.messages.map((m) =>
+          toModelMessage(m, options.replayReasoning === true),
+        )
+      : params.messages;
+  if (!params.conversationId || !messages.length) {
+    return { messages };
   }
-  const last = params.messages.length - 1;
+  const last = messages.length - 1;
   const breakpoint = {
     anthropic: { cacheControl: { type: "ephemeral" } },
+    ...(options.bedrockCachePoint
+      ? { bedrock: { cachePoint: { type: "default" } } }
+      : {}),
   };
   return {
-    messages: params.messages.map((message, index): AiSdk.ModelMessage => {
+    messages: messages.map((message, index): AiSdk.ModelMessage => {
       if (index !== last) return message;
       return message.role === "assistant"
         ? { role: "assistant", content: message.content, providerOptions: breakpoint }
@@ -371,6 +431,7 @@ export function withPrefixCacheHints(params: StreamChatParams): {
     }),
     providerOptions: {
       openai: { promptCacheKey: params.conversationId },
+      azure: { promptCacheKey: params.conversationId },
     },
   };
 }
@@ -407,7 +468,10 @@ export async function streamAiSdk(
             : e.message,
           { cause: e },
         );
-  const cacheHints = withPrefixCacheHints(params);
+  const cacheHints = withPrefixCacheHints(params, {
+    replayReasoning: config.replayReasoning,
+    bedrockCachePoint: config.bedrockCachePoint,
+  });
   const providerOptions: StreamTextProviderOptions = {
     ...(cacheHints.providerOptions ?? {}),
     ...(config.provider === "openrouter"
@@ -433,14 +497,20 @@ export async function streamAiSdk(
 
   try {
     const result = sdk.streamText({
-      model: config.model,
+      model: sdk.wrapLanguageModel({
+        model: config.model,
+        middleware: providerDeadlines(params.callbacks?.onActivity),
+      }),
       system: params.systemPrompt,
       messages: cacheHints.messages,
       ...(Object.keys(providerOptions).length
         ? { providerOptions }
         : {}),
       tools,
-      maxOutputTokens: maxOutputTokensFor(config.provider),
+      maxOutputTokens: maxOutputTokensFor(
+        config.provider,
+        config.defaultMaxOutputTokens?.(params.reasoning),
+      ),
       stopWhen: sdk.stepCountIs(maxIterations),
       abortSignal: internalAbort.signal,
       reasoning:
@@ -538,6 +608,10 @@ export async function streamAiSdk(
         case "error":
           throw guardAbortShaped(toProviderStreamError(part.error, config));
         case "abort": {
+          const stalled = params.abortSignal?.aborted
+            ? null
+            : asProviderStallError(part.reason, config);
+          if (stalled) throw stalled;
           const error = new Error(part.reason || "Stream aborted.");
           error.name = "AbortError";
           throw error;
@@ -580,16 +654,41 @@ export async function completeAiSdkText(
     systemPrompt?: string;
     user: string;
     maxTokens?: number;
+    abortSignal?: AbortSignal;
   },
   config: AiSdkAdapterConfig,
 ): Promise<string> {
   const { generateText } = await import("ai");
+  const reasoning =
+    config.supportsReasoning === false
+      ? undefined
+      : normalizeReasoningLevelForModel(config.modelId, "none");
+  const requested = params.maxTokens ?? 512;
   const result = await generateText({
     model: config.model,
     system: params.systemPrompt,
     prompt: params.user,
-    maxOutputTokens: params.maxTokens ?? 512,
-    reasoning: config.supportsReasoning === false ? undefined : "none",
+    abortSignal: params.abortSignal,
+    // Some models cannot turn thinking off ("none" is normalized to the
+    // lowest level they accept), and thinking is output too. Without
+    // headroom a short call — a 64-token title — can spend its whole
+    // allowance thinking and return no text. The cap is only a ceiling, so
+    // the headroom costs nothing unless the model actually uses it.
+    maxOutputTokens:
+      reasoning && reasoning !== "none"
+        ? requested + COMPLETION_REASONING_HEADROOM_TOKENS
+        : requested,
+    reasoning: reasoning as
+      | Exclude<NonNullable<StreamChatParams["reasoning"]>, "max">
+      | undefined,
   });
   return result.text;
 }
+
+/**
+ * Extra output allowance for one-shot completions on models that always
+ * reason (Opus 5.5, Fable 5.1, GPT-6 Astra/Sol 6.1 — directly, or through
+ * Bedrock, Vertex, Foundry, Azure or a router). 4,096 matches what
+ * @ai-sdk/amazon-bedrock adds on top of a thinking budget for the answer.
+ */
+export const COMPLETION_REASONING_HEADROOM_TOKENS = 4_096;

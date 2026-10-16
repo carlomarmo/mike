@@ -48,6 +48,7 @@ async function runStreamWithModel(
     db: Record<string, unknown>,
     model: string,
     apiKeys?: Record<string, string | null>,
+    orgId?: string,
 ) {
     await runLLMStream({
         apiMessages: [{ role: "user", content: "hello" }],
@@ -60,7 +61,54 @@ async function runStreamWithModel(
         write: vi.fn(),
         model,
         apiKeys: apiKeys as never,
+        orgId,
     });
+}
+
+// A member of org-1, which holds an OpenRouter key and has approved one
+// model for it; the member's own saved list names a different one.
+function organizationDb() {
+    const tables: Record<string, Record<string, unknown>[]> = {
+        org_members: [{ org_id: "org-1", user_id: "user-1" }],
+        org_api_keys: [{ org_id: "org-1", provider: "openrouter" }],
+        org_router_models: [
+            { org_id: "org-1", router: "openrouter", model_id: "firm/approved" },
+        ],
+        user_router_models: [
+            { user_id: "user-1", router: "openrouter", model_id: "mine/own" },
+        ],
+    };
+    return {
+        from: vi.fn((table: string) => {
+            const filters: [string, unknown][] = [];
+            const rows = () =>
+                (tables[table] ?? []).filter((row) =>
+                    filters.every(([column, value]) => row[column] === value),
+                );
+            const query = {
+                select: () => query,
+                is: () => query,
+                order: () => query,
+                eq(column: string, value: unknown) {
+                    filters.push([column, value]);
+                    return query;
+                },
+                maybeSingle: async () => ({
+                    data: rows()[0] ?? null,
+                    error: null,
+                }),
+                then: (
+                    resolve: (value: unknown) => unknown,
+                    reject?: (reason: unknown) => unknown,
+                ) =>
+                    Promise.resolve({ data: rows(), error: null }).then(
+                        resolve,
+                        reject,
+                    ),
+            };
+            return query;
+        }),
+    };
 }
 
 function tablesQueried(db: Record<string, unknown>): unknown[] {
@@ -82,7 +130,7 @@ describe("runLLMStream router-model allowlist", () => {
         });
         const mapped = toProviderStreamError(original, { label: "Gemini", modelId: "gemini-2.5-pro" });
         streamChatWithTools.mockRejectedValueOnce(mapped);
-        const error = await runStreamWithModel(routerModelsDb([]), "claude-fable-5").catch((err: unknown) => err);
+        const error = await runStreamWithModel(routerModelsDb([]), "claude-fable-5-1").catch((err: unknown) => err);
         expect(error).toBeInstanceOf(AssistantStreamError);
         if (!(error instanceof AssistantStreamError)) throw error;
         expect(error.cause).toBe(mapped);
@@ -110,8 +158,42 @@ describe("runLLMStream router-model allowlist", () => {
         await expect(
             runStreamWithModel(db, "openrouter/pricy/frontier-model"),
         ).rejects.toThrow(
-            /openrouter\/pricy\/frontier-model is not in your saved OpenRouter models .* Settings → Bring Your Own Keys → Routers/,
+            /openrouter\/pricy\/frontier-model is not in your saved OpenRouter models .* Settings → Bring Your Own Keys and add it under Model Selections/,
         );
+        expect(streamChatWithTools).not.toHaveBeenCalled();
+    });
+
+    it("runs a model the organization approved for its key, in the organization's work", async () => {
+        // The member never saved this model themselves. Judging it against
+        // their own list would fail a turn the selection step just allowed.
+        await runStreamWithModel(
+            organizationDb(),
+            "openrouter/firm/approved",
+            undefined,
+            "org-1",
+        );
+
+        expect(streamChatWithTools).toHaveBeenCalledWith(
+            expect.objectContaining({ model: "openrouter/firm/approved" }),
+        );
+    });
+
+    it("does not let a member's own list widen what the organization's key runs", async () => {
+        await expect(
+            runStreamWithModel(
+                organizationDb(),
+                "openrouter/mine/own",
+                undefined,
+                "org-1",
+            ),
+        ).rejects.toThrow(/organization's saved OpenRouter models/);
+        expect(streamChatWithTools).not.toHaveBeenCalled();
+    });
+
+    it("keeps the organization's list out of personal work", async () => {
+        await expect(
+            runStreamWithModel(organizationDb(), "openrouter/firm/approved"),
+        ).rejects.toThrow(/your saved OpenRouter models/);
         expect(streamChatWithTools).not.toHaveBeenCalled();
     });
 
@@ -143,7 +225,7 @@ describe("runLLMStream router-model allowlist", () => {
             expect.objectContaining({
                 type: "error",
                 message: expect.stringContaining(
-                    "Settings → Bring Your Own Keys → Routers",
+                    "Settings → Bring Your Own Keys and add it under Model Selections",
                 ),
             }),
         );
@@ -181,10 +263,10 @@ describe("runLLMStream router-model allowlist", () => {
 
     it("does not consult the router selection for first-party models", async () => {
         const db = routerModelsDb([]);
-        await runStreamWithModel(db, "claude-fable-5");
+        await runStreamWithModel(db, "claude-fable-5-1");
 
         expect(streamChatWithTools).toHaveBeenCalledWith(
-            expect.objectContaining({ model: "claude-fable-5" }),
+            expect.objectContaining({ model: "claude-fable-5-1" }),
         );
         expect(tablesQueried(db)).not.toContain("user_router_models");
     });

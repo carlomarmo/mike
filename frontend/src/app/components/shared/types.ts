@@ -3,8 +3,6 @@ import type { AssistantEvent as WireAssistantEvent } from "@mike/contracts";
 
 import type {
   SourceDocument,
-  SourceDocumentAction,
-  SourceDocumentMetadata,
   SourceDocumentQuote,
   SourceDocumentType,
   SourceSubdocument,
@@ -37,6 +35,13 @@ export interface LibraryFolder {
 
 export type ResourceAccessScope = "private" | "shared" | "organization";
 
+/**
+ * Who may open an organization's project or workflow without being named:
+ * nobody ("private", the default) or every member of its organization.
+ * A personal item is always "private"; it is shared by naming people.
+ */
+export type ContentVisibility = "private" | "organization";
+
 export interface Project {
   id: string;
   /** The creator. Null once an org project outlives the account that made it. */
@@ -50,8 +55,10 @@ export interface Project {
    */
   access_role?: "owner" | "editor" | "viewer";
   /** The caller's role in the owning organization, if the project has one. */
-  org_role?: "admin" | "member" | null;
+  org_role?: "owner" | "admin" | "member" | null;
   org_id?: string | null;
+  /** Present on the detail payload; the lists carry `access_scope` instead. */
+  visibility?: ContentVisibility;
   access_scope?: ResourceAccessScope;
   organization_name?: string | null;
   direct_grant_count?: number;
@@ -101,6 +108,8 @@ export interface Document {
   pdf_storage_path: string | null;
   size_bytes: number | null;
   page_count: number | null;
+  /** PDF pages without a text layer; null for non-PDFs and unmeasured versions. */
+  textless_page_count?: number | null;
   structure_tree: StructureNode[] | null;
   status: "pending" | "processing" | "ready" | "error";
   created_at: string | null;
@@ -116,8 +125,6 @@ export interface Document {
 }
 
 export type PanelDocumentType = SourceDocumentType;
-export type PanelDocumentMetadata = SourceDocumentMetadata;
-export type PanelDocumentAction = SourceDocumentAction;
 export type PanelDocumentQuote = SourceDocumentQuote;
 export type PanelSubdocument = SourceSubdocument;
 export type PanelDocument = SourceDocument;
@@ -582,11 +589,6 @@ export function isSpreadsheetFilename(filename: string): boolean {
   return ext === "xlsx" || ext === "xlsm" || ext === "xls";
 }
 
-export function isDocxFilename(filename: string): boolean {
-  const ext = filename.split(".").pop()?.toLowerCase();
-  return ext === "docx" || ext === "doc";
-}
-
 /**
  * Human-readable cell locator for a spreadsheet citation, e.g. "Sheet1!B7".
  * Falls back to whichever of `sheet`/`cell` is present.
@@ -779,6 +781,8 @@ export interface Workflow {
   id: string;
   user_id: string | null;
   org_id?: string | null;
+  /** Present on the detail payload; the lists carry `access_scope` instead. */
+  visibility?: ContentVisibility;
   access_scope?: ResourceAccessScope;
   organization_name?: string | null;
   direct_grant_count?: number;

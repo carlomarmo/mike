@@ -11,6 +11,7 @@ import type {
 // parity tests) never pull this module, and its runtime imports, into
 // the web app's type-check graph.
 export type { ApiKeyStatus } from "../types";
+import type { RouterProfileLists } from "@mike/model-catalog";
 import { describeNetworkFailure } from "../lib/networkError";
 import { reportApiFailure, reportNetworkFailure } from "../lib/errorReporting";
 import type { ReasoningLevel } from "../lib/wordChatTypes";
@@ -177,7 +178,12 @@ async function toApiError(
     });
     const apiError = new MikeApiError({
       status: response.status,
-      message: text || `API error: ${response.status}`,
+      // A body that is not our JSON came from something in front of the
+      // API (a proxy's HTML error page, a load balancer's plain text). It
+      // is not written for users, so it never becomes the message; the
+      // devLog above keeps a preview for debugging. describeError turns
+      // this placeholder into the sentence for the status.
+      message: `API error: ${response.status}`,
     });
     if (response.status >= 500) {
       reportApiFailure({
@@ -268,7 +274,8 @@ export async function listProjects(pagination?: {
   return apiRequest<Project[]>(`/projects?${params.toString()}`);
 }
 
-interface UserProfile {
+/** GET /user/profile; each router's Model Selections may be absent on an older API. */
+interface UserProfile extends Partial<RouterProfileLists> {
   displayName: string | null;
   organisation: string | null;
   messageCreditsUsed: number;
@@ -281,9 +288,6 @@ interface UserProfile {
   lastSelectedReasoningLevel: ReasoningLevel;
   mfaOnLogin: boolean;
   legalResearchUs: boolean;
-  openRouterModels: string[];
-  vercelModels: string[];
-  openCodeGoModels: string[];
   apiKeyStatus: ApiKeyStatus;
 }
 

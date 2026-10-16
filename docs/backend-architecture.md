@@ -166,9 +166,15 @@ by `submitClientToolResult`, but the document work has already happened twice.
 
 Runs live in process memory. A finished run is retained for
 `FINISHED_RUN_RETENTION_MS` (60 s) so a late reconnect still gets the
-terminal frames, and a run that outlives `MAX_RUN_LIFETIME_MS` (30 min) is
-stopped as a safety net. A resume therefore has to reach the replica that is
-generating: run one replica, or route by session, until the buffer is moved
+terminal frames. Runs stop after five minutes without useful progress or a
+four-hour maximum lifetime (both configurable). Provider calls have separate
+two-minute first-output and 60-second inter-output limits, including waiting
+for response headers. Provider clocks stop at the end of each provider step,
+so local tool execution is governed by its own timeout and the run limits.
+Model output refreshes idle even while tabular JSON is buffered; transport
+keep-alives do not. Deadline errors are preserved in history and replay, while
+an explicit Stop remains a cancellation. A resume has to reach the replica
+that is generating: run one replica, or route by session, until the buffer is moved
 to shared storage. `lib/assistantSse.ts` (`openAssistantSse`) survives only
 for the one case that cannot be a run: a tabular review chat whose
 preparation produced no chat id, so there is no key to register under and
@@ -271,7 +277,7 @@ following rules have a single implementation:
 | Delete collection documents and durably clean all version artifacts | `modules/documents/documents.cleanup.ts`, exported as `deleteCollectionDocuments` | Project callers authorize `docs.organize` and select document IDs inside that project first. Library callers supply the authenticated user's ID and collection; the operation filters eligible IDs. Deletion repeats the scope predicates; database triggers capture source, PDF, and extracted-text keys in the same transaction. |
 | Resolve a chat turn's model and reasoning level | `modules/user/user.chatSelection.ts`, exported as `resolveUserChatSelection` | Authorize the chat first; retain each surface's persistence, error mapping, and stream lifetime. Selection itself does not mutate chats or saved preferences. |
 | Validate folder paths and moves; collect a deletion subtree | `lib/folderTree.ts` | Supply a scoped folder list/loader and retain the endpoint's validation order and error messages. |
-| Resolve an assignable organization member | `lib/orgAccessOverrides.ts`, `findAssignableOrgMember` | Authorize the actor's access-management permission and validate the requested role before resolving the target. Creators and organization admins retain owner access. |
+| Resolve an assignable organization member | `lib/orgAccessOverrides.ts`, `findAssignableOrgMember` | Authorize the actor's access-management permission and validate the requested role before resolving the target. Preserve creator ownership and the item's visibility-specific organization-owner rules; organization admins receive no implicit Owner role. |
 
 Shared code must preserve meaningful differences. Library renames still expose
 `folder_id` and project renames still conceal denied project access as 404.

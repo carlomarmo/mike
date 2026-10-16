@@ -17,6 +17,7 @@ import {
     attachStreamRunSse,
     getActiveStreamRun,
     startStreamRun,
+    stopOutcomeFrame,
 } from "../../lib/streamRuns";
 import {
     attachAssistantTurnSse,
@@ -34,7 +35,7 @@ import {
     AssistantStreamError,
     assistantStreamErrorPayload,
     ASSISTANT_ERROR_MESSAGE,
-    buildCancelledAssistantMessage,
+    buildStoppedAssistantMessage,
     isAbortError,
     runLLMStream,
     stripTransientAssistantEvents,
@@ -103,6 +104,10 @@ import {
 } from "../../lib/memory/schedule";
 import { parsePaginationQuery } from "../../lib/pagination";
 import { normalizeSearchTerm } from "../../lib/search";
+import {
+    resolveWorkspaceFilter,
+    sendWorkspaceFailure,
+} from "../../lib/workspace";
 import { parseTabularReviewSort } from "../../lib/sort";
 import { parseTabularReviewScope } from "./tabular.overview";
 
@@ -143,14 +148,19 @@ function projectIdFilterOf(query: Record<string, unknown>): string | null {
 // GET /tabular-review
 tabularRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
     const query = req.query as Record<string, unknown>;
-    const result = await listTabularReviews(createServerSupabase(), {
-        userId: res.locals.userId as string,
+    const db = createServerSupabase();
+    const userId = res.locals.userId as string;
+    const workspace = await resolveWorkspaceFilter(db, userId, query.workspace);
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+    const result = await listTabularReviews(db, {
+        userId,
         userEmail: res.locals.userEmail as string | undefined,
         projectIdFilter: projectIdFilterOf(query),
         scope: parseTabularReviewScope(query.scope),
         pagination: parsePaginationQuery(query),
         searchTerm: normalizeSearchTerm(query.search),
         sort: parseTabularReviewSort(query),
+        workspace: workspace.workspace,
     });
     if (!result.ok) return void sendTabularFailure(res, result);
     res.json(result.data);
@@ -162,12 +172,17 @@ tabularRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
 // have to page through full review payloads just to collect checkboxes.
 tabularRouter.get("/ids", requireAuth, asyncRoute(async (req, res) => {
     const query = req.query as Record<string, unknown>;
-    const result = await listTabularReviewIds(createServerSupabase(), {
-        userId: res.locals.userId as string,
+    const db = createServerSupabase();
+    const userId = res.locals.userId as string;
+    const workspace = await resolveWorkspaceFilter(db, userId, query.workspace);
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+    const result = await listTabularReviewIds(db, {
+        userId,
         userEmail: res.locals.userEmail as string | undefined,
         projectIdFilter: projectIdFilterOf(query),
         scope: parseTabularReviewScope(query.scope),
         searchTerm: normalizeSearchTerm(query.search),
+        workspace: workspace.workspace,
     });
     if (!result.ok) return void sendTabularFailure(res, result);
     res.json(result.data);
@@ -576,6 +591,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, asyncRoute(async (req, re
 
         let sentGenerationError = false;
         const completed = await streamTabularGenerateSync({
+            onActivity: run.touch,
             write,
             db,
             reviewId,
@@ -611,7 +627,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, asyncRoute(async (req, re
             // Stopped. The cells are already back to "pending"; tell every
             // attached reader how the run ended, the way a chat turn does,
             // so a second tab does not sit on a spinner.
-            write(`data: ${JSON.stringify({ type: "cancelled" })}\n\n`);
+            write(stopOutcomeFrame(run));
             write("data: [DONE]\n\n");
         }
     } catch (err) {
@@ -950,6 +966,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
         memorySharedAudience,
         memoryTurn,
         model: selectedChatModel,
+        orgId,
         readableMemoryProjectId,
         reasoningLevel: selectedReasoningLevel,
         reviewTitle,
@@ -1021,6 +1038,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
 
     try {
         const { fullText, events } = await runLLMStream({
+            onActivity: run?.touch,
             apiMessages,
             docStore: new Map(),
             docIndex: {},
@@ -1035,6 +1053,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
             model: selectedChatModel,
             reasoning: selectedReasoningLevel,
             apiKeys: api_keys,
+            orgId,
             signal: stream.signal,
             conversationId: chatId,
             includeMemory: true,
@@ -1109,7 +1128,8 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
         if (isAbortError(err)) {
             console.log("[tabular/chat] turn stopped", { chatId });
             if (chatId && err instanceof AssistantStreamError) {
-                const partial = buildCancelledAssistantMessage({
+                const partial = buildStoppedAssistantMessage({
+                    stopReason: run?.stopReason,
                     fullText: err.fullText,
                     events: err.events,
                     buildCitations: (fullText) =>
@@ -1132,8 +1152,8 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
             }
             // Readers still attached (Stop came from another tab, or this one
             // is only watching) learn the outcome the same way a reload
-            // would: the stored row now ends "Cancelled by user."
-            write(`data: ${JSON.stringify({ type: "cancelled" })}\n\n`);
+            // would: persistence uses the same stop reason.
+            write(stopOutcomeFrame(run));
             write("data: [DONE]\n\n");
             return;
         }
