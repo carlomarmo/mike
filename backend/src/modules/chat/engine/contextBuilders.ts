@@ -2,6 +2,8 @@ import { responseLanguageName } from "../../../lib/responseLanguages";
 import { deadlineMessage, type StreamStopReason } from "../../../lib/streamRuns";
 import crypto from "crypto";
 import type { Db } from "../../../lib/supabase";
+import { listWorkspaceWorkflows } from "../../../lib/workflowWorkspace";
+import { teamOrgIdOf } from "../../../lib/personalOrgs";
 import { ensureDocAccess } from "../../../lib/access";
 import { attachActiveVersionPaths } from "../../../lib/documentVersions";
 import {
@@ -803,6 +805,7 @@ const COMPLETES_TEXTLESS_TURN = {
   ask_inputs_response: false,
   doc_read: false,
   doc_find: false,
+  doc_search: false,
   doc_created: true,
   doc_download: true,
   doc_replicated: true,
@@ -1296,7 +1299,14 @@ export async function buildDocContext(
     // asked about, so ask once per container and reuse the answer; a
     // document with no container at all still resolves individually, which
     // costs nothing (it is a `user_id === caller` comparison in memory).
+    //
+    // A document filed on its own under an organization has no container
+    // either: it is its uploader's alone, while they are a member. That
+    // verdict turns on the uploader as well as the organization, so the two
+    // together are the key — one answer per organization would hand a
+    // colleague's files to whoever's own file happened to be asked first.
     const containerKey = (doc: {
+      user_id: string | null;
       project_id: string | null;
       workflow_id?: string | null;
       org_id?: string | null;
@@ -1306,16 +1316,18 @@ export async function buildDocContext(
         : doc.workflow_id
           ? `workflow:${doc.workflow_id}`
           : doc.org_id
-            ? `org:${doc.org_id}`
+            ? `org:${doc.org_id}:${doc.user_id ?? ""}`
             : null;
 
     const verdictByContainer = new Map<string, boolean>();
     for (const doc of candidates) {
       const key = containerKey(doc);
       if (!key || verdictByContainer.has(key)) continue;
-      // The representative carries the container this verdict is about; its
-      // `user_id` only ever decides the ROLE, never `ok`, so reusing one
-      // document's answer for its siblings cannot widen access.
+      // The representative carries the container this verdict is about. In
+      // a project or a workflow its `user_id` only ever decides the ROLE,
+      // never `ok`, so reusing one document's answer for its siblings cannot
+      // widen access; on its own in an organization the uploader is part of
+      // the key.
       const verdict = await ensureDocAccess(doc, userId, userEmail ?? null, db);
       verdictByContainer.set(key, verdict.ok);
     }
@@ -1480,14 +1492,13 @@ export async function buildWorkflowStore(
   userId: string,
   userEmail: string | null | undefined,
   db: Db,
+  orgId: string | null = null,
 ): Promise<WorkflowStore> {
   const store: WorkflowStore = new Map();
-  const normalizedUserEmail = (userEmail ?? "").trim().toLowerCase();
+  const workspace = (await teamOrgIdOf(db, orgId)) ?? "personal";
 
-  // Best-effort: the chat routes call this outside their try blocks, so a
-  // thrown error here becomes an unhandled rejection that kills the process
-  // (Express 4 does not forward async errors). A chat must never fail —
-  // let alone crash the backend — because default installation failed.
+  // Default installation is best-effort; authorization and catalog reads below
+  // still fail closed if the workspace cannot be resolved.
   try {
     await ensureDefaultWorkflows(userId, db);
   } catch (err) {
@@ -1520,46 +1531,16 @@ export async function buildWorkflowStore(
     }
   }
 
-  // Then overlay user-owned assistant workflows.
-  const { data: workflows } = await db
-    .from("workflows")
-    .select("id, title, prompt_md")
-    .eq("user_id", userId)
-    .eq("type", "assistant");
-  for (const wf of workflows ?? []) {
+  // Only workflows currently authorized in the conversation's workspace.
+  // Global catalog entries above are the sole workspace-independent exception.
+  const workflows = await listWorkspaceWorkflows<{
+    id: string;
+    title: string;
+    prompt_md: string;
+  }>(db, { userId, userEmail, type: "assistant", workspace });
+  for (const wf of workflows) {
     if (wf.prompt_md) {
-      store.set(wf.id, {
-        title: wf.title,
-        skill_md: wf.prompt_md,
-        listed: true,
-      });
-    }
-  }
-
-  // Shared assistant workflows must also be readable by workflow tools.
-  if (normalizedUserEmail) {
-    const { data: shares } = await db
-      .from("workflow_shares")
-      .select("workflow_id")
-      .eq("shared_with_email", normalizedUserEmail);
-    const sharedIds = [
-      ...new Set((shares ?? []).map((share) => share.workflow_id)),
-    ];
-    if (sharedIds.length > 0) {
-      const { data: sharedWorkflows } = await db
-        .from("workflows")
-        .select("id, title, prompt_md")
-        .in("id", sharedIds)
-        .eq("type", "assistant");
-      for (const wf of sharedWorkflows ?? []) {
-        if (wf.prompt_md) {
-          store.set(wf.id, {
-            title: wf.title,
-            skill_md: wf.prompt_md,
-            listed: true,
-          });
-        }
-      }
+      store.set(wf.id, { title: wf.title, skill_md: wf.prompt_md, listed: true });
     }
   }
   const databaseWorkflowIds = [...store.entries()]

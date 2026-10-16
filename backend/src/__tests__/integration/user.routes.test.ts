@@ -239,10 +239,30 @@ vi.mock("../../modules/user/user.apiKeyStore", async (importOriginal) => {
     getSavedApiKeySettings: (
         actual as unknown as Record<string, unknown>
     ).getSavedApiKeySettings,
-    updateUserApiKeySettings: (...args: unknown[]) =>
-        updateUserApiKeySettings(...args),
+    // The store serves a person's keys and an organization's through one
+    // owner-based implementation. These routes are the personal ones, so
+    // each owner-based call is handed to the spy the tests already assert
+    // on, with the owner unwrapped to the user id it carries.
+    userKeyOwner: actual.userKeyOwner,
+    orgKeyOwner: actual.orgKeyOwner,
+    updateApiKeySettings: (owner: { id: string }, ...args: unknown[]) =>
+        updateUserApiKeySettings(owner.id, ...args),
     getUserApiKeyStatus: (...args: unknown[]) => getUserApiKeyStatus(...args),
+    getApiKeyStatusFor: (owner: { id: string }, ...args: unknown[]) =>
+        getUserApiKeyStatus(owner.id, ...args),
     saveUserApiKey: (...args: unknown[]) => saveUserApiKey(...args),
+    saveApiKeyFor: (
+        owner: { id: string },
+        provider: string,
+        value: string | null,
+        db: unknown,
+        settings: Record<string, unknown> = {},
+    ) =>
+        // A provider with no companion setting was, and is asserted as, a
+        // four-argument save.
+        actual.isSettingsApiKeyProvider(provider as never)
+            ? saveUserApiKey(owner.id, provider, value, db, settings)
+            : saveUserApiKey(owner.id, provider, value, db),
     hasEnvApiKey: (...args: unknown[]) => hasEnvApiKey(...args),
     normalizeApiKeyProvider: (...args: unknown[]) =>
         normalizeApiKeyProvider(...args),
@@ -362,6 +382,94 @@ describe("user.routes", () => {
         buildUserChatsExport.mockResolvedValue({ chats: "data" });
         buildUserTabularReviewsExport.mockResolvedValue({ reviews: "data" });
         supabaseRpc.mockResolvedValue({ data: null, error: null });
+    });
+
+    describe("profile photos", () => {
+        const photo = "data:image/png;base64,iVBORw0KGgo=";
+        it("saves, serializes and removes the caller's photo", async () => {
+            supabaseState.tables.user_profiles = { data: { ...profileRow(), profile_photo: photo }, error: null };
+            const saved = await request(app).put("/user/profile/photo").set(...AUTH).send({ data_url: photo, user_id: "another-user" });
+            expect(saved.status).toBe(200);
+            expect(saved.body).toEqual({ profilePhoto: photo });
+            expect(saved.headers["cache-control"]).toBe("private, no-store");
+            const loaded = await request(app).get("/user/profile").set(...AUTH);
+            expect(loaded.body.profilePhoto).toBe(photo);
+            const removed = await request(app).delete("/user/profile/photo").set(...AUTH);
+            expect(removed.status).toBe(200);
+            expect(removed.body).toEqual({ profilePhoto: null });
+        });
+        it.each([
+            "memory_curator_model", "project_memory_default",
+            "last_selected_reasoning_level", "last_selected_chat_model",
+            "dark_mode", "password_set_at", "onboarding_version",
+            "quick_actions_visible", "legal_research_us", "mfa_on_login", "title_model",
+        ])("keeps the saved photo on profile reload when %s is absent", async (column) => {
+            supabaseState.missingColumns = [column];
+            supabaseState.tables.user_profiles = {
+                data: { ...profileRow(), profile_photo: photo }, error: null,
+            };
+            const res = await request(app).get("/user/profile").set(...AUTH);
+            expect(res.status).toBe(200);
+            expect(res.body.profilePhoto).toBe(photo);
+            // The mock returns the seeded row; also assert the successful query
+            // actually requests the photo, as the live database requires.
+            const selects = supabaseState.selects.user_profiles;
+            expect(selects.length).toBeGreaterThan(1);
+            expect(selects.at(-1)?.split(/,\s*/)).toContain("profile_photo");
+        });
+        it("keeps profiles readable when both a preference and the photo column are absent", async () => {
+            supabaseState.missingColumns = ["memory_curator_model", "profile_photo"];
+            supabaseState.tables.user_profiles = { data: profileRow(), error: null };
+            const res = await request(app).get("/user/profile").set(...AUTH);
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ displayName: "Ada", profilePhoto: null });
+            const columns = supabaseState.selects.user_profiles.at(-1)?.split(/,\s*/);
+            expect(columns).not.toContain("profile_photo");
+            expect(columns).not.toContain("memory_curator_model");
+        });
+        it("rejects non-raster and missing data", async () => {
+            for (const data_url of [undefined, "data:image/svg+xml;base64,PHN2Zy8+", "data:image/png;base64,PHN2Zy8+"]) {
+                const res = await request(app).put("/user/profile/photo").set(...AUTH).send({ data_url });
+                expect(res.status).toBe(400);
+            }
+            expect(supabaseState.updates.user_profiles).toBeUndefined();
+        });
+        it("keeps older profiles readable before the migration", async () => {
+            supabaseState.missingColumns = ["profile_photo"];
+            supabaseState.tables.user_profiles = { data: profileRow(), error: null };
+            const res = await request(app).get("/user/profile").set(...AUTH);
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ displayName: "Ada", profilePhoto: null });
+        });
+    });
+
+    describe("GET /user/lookup", () => {
+        it("does not select or expose an unrelated user's photo", async () => {
+            supabaseState.tables.user_profiles = {
+                data: {
+                    user_id: "unrelated-user",
+                    email: "alice@example.com",
+                    display_name: "Alice",
+                    profile_photo: "data:image/png;base64,iVBORw0KGgo=",
+                },
+                error: null,
+            };
+
+            const res = await request(app)
+                .get("/user/lookup")
+                .query({ email: "ALICE@example.com" })
+                .set(...AUTH);
+
+            expect(res.status).toBe(200);
+            expect(res.body).toEqual({
+                exists: true,
+                email: "alice@example.com",
+                display_name: "Alice",
+            });
+            expect(supabaseState.selects.user_profiles).toEqual([
+                "user_id, email, display_name",
+            ]);
+        });
     });
 
     // ── GET /user/profile (MFA bootstrap path) ────────────────────────────
@@ -1631,13 +1739,9 @@ describe("user.routes", () => {
                 .set(...AUTH);
 
             expect(res.status).toBe(204);
-            // Durable job queued...
-            const jobInserts = (supabaseState.inserts.db_jobs ?? []) as Record<
-                string,
-                unknown
-            >[];
-            expect(jobInserts).toHaveLength(1);
-            expect(jobInserts[0]).toMatchObject({ kind: "account.delete" });
+            expect(supabaseRpc).toHaveBeenCalledWith("request_account_deletion", {
+                p_user_id: "u1", p_user_email: "u1@test.local",
+            });
             // ...auth user still present, so the cascade can still read the
             // storage paths it is about to delete.
             expect(adminDeleteUser).not.toHaveBeenCalled();
@@ -1649,7 +1753,7 @@ describe("user.routes", () => {
         // SOLE-ADMIN REFUSAL. Deleting this account would either hand the
         // organization to an arbitrary successor or strand it with no members
         // at all, so the product refuses and names the organizations.
-        it("DELETE /user/account returns 409 for the sole admin of a live org", async () => {
+        it("DELETE /user/account returns 409 for the sole owner of a live org", async () => {
             listOrgsBlockingAccountDeletion.mockResolvedValue([
                 { org_id: "o1", name: "Org A", reason: "members" },
                 { org_id: "o2", name: "Org B", reason: "content" },
@@ -1662,7 +1766,7 @@ describe("user.routes", () => {
             expect(res.status).toBe(409);
             expect(res.body.code).toBe("org_successor_required");
             expect(res.body.detail).toBe(
-                "You are the only admin of Org A. Make another member an admin, or delete the organization, before deleting your account. You are the only admin of Org B, which still owns content. Delete or move the organization's projects, workflows, documents and reviews, or delete the organization, before deleting your account.",
+                "You are the only owner of Org A. Make another member an owner, or delete the organization, before deleting your account. You are the only owner of Org B, and must appoint another owner or explicitly delete the organization before deleting your account.",
             );
             expect(res.body.organizations).toEqual([
                 { org_id: "o1", name: "Org A", reason: "members" },
@@ -1670,14 +1774,14 @@ describe("user.routes", () => {
             ]);
             // Nothing was scheduled, nothing was revoked, nothing was
             // destroyed — the user is still signed in and can appoint an
-            // admin. The old behaviour answered 204, revoked the session and
+            // owner. The old behaviour answered 204, revoked the session and
             // then failed the job forever.
             expect(supabaseState.inserts.db_jobs ?? []).toHaveLength(0);
             expect(adminSignOut).not.toHaveBeenCalled();
             expect(deleteUserAccountData).not.toHaveBeenCalled();
         });
 
-        it("DELETE /user/account refuses the inline path for a sole admin too", async () => {
+        it("DELETE /user/account refuses the inline path for a sole owner too", async () => {
             // The no-runner fallback runs the cascade synchronously, so the
             // check must gate it as well.
             dbJobsEnabled.mockReturnValue(false);
@@ -1728,10 +1832,10 @@ describe("user.routes", () => {
         it("DELETE /user/account returns 500 when the cascade cannot be scheduled", async () => {
             // Nothing has been destroyed yet, so the request is cleanly
             // retriable — it must not answer 204.
-            supabaseState.tables.db_jobs = {
+            supabaseRpc.mockResolvedValueOnce({
                 data: null,
                 error: { code: "08006", message: "connection lost" },
-            };
+            });
 
             const res = await request(app)
                 .delete("/user/account")

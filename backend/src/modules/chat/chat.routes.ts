@@ -42,9 +42,11 @@ import {
     reserveAssistantMessage,
 } from "./engine/index";
 import { normalizeEmail } from "../../lib/access";
+import { teamOrgIdOf } from "../../lib/personalOrgs";
 import { can } from "../../lib/permissions";
 import { generateAssistantChatTitle, logChatTitleFailure } from "./chat.title";
 import { sendInternalError } from "../../lib/httpError";
+import { sendServiceFailure } from "../../lib/serviceResult";
 import { titleModelForChat } from "../../lib/modelSelection";
 import {
     releaseMemoryConversationTurn,
@@ -62,9 +64,15 @@ import {
     listChats,
     prepareChatStream,
     revokeChatAccess,
+    leaveChat,
+    withChatLeaveAccess,
     updateChatSettings,
     updateChatTitle,
 } from "./chat.service";
+import {
+    resolveWorkspaceFilter,
+    sendWorkspaceFailure,
+} from "../../lib/workspace";
 
 export const chatRouter = Router();
 
@@ -108,6 +116,13 @@ chatRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
         return void res.status(400).json({ detail: "Invalid chat cursor" });
     }
 
+    const workspace = await resolveWorkspaceFilter(
+        db,
+        userId,
+        req.query.workspace,
+    );
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+
     const result = await listChats(db, {
         userId,
         userEmail,
@@ -115,6 +130,7 @@ chatRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
         offset,
         beforeUpdatedAt,
         beforeId,
+        workspace: workspace.workspace,
     });
     if (!result.ok) return void sendInternalError(res, result.error);
     res.json(result.data);
@@ -131,7 +147,12 @@ chatRouter.post("/create", requireAuth, asyncRoute(async (req, res) => {
     const projectId = parsedProjectId.value.projectId;
     const db = createServerSupabase();
 
-    const result = await createChat(db, { userId, userEmail, projectId });
+    const result = await createChat(db, {
+        userId,
+        userEmail,
+        projectId,
+        orgId: req.body?.org_id,
+    });
     if (!result.ok) {
         if (result.kind === "error")
             return void sendInternalError(res, result.error);
@@ -153,11 +174,17 @@ chatRouter.get("/:chatId", requireAuth, asyncRoute(async (req, res) => {
     if (!access.ok)
         return void res.status(404).json({ detail: "Chat not found" });
 
+    const leaveAccess = await withChatLeaveAccess(
+        db,
+        [{ ...access.chat, access_role: access.projectRole }],
+        userEmail,
+    );
+    if (!leaveAccess.ok) return void sendServiceFailure(res, leaveAccess);
     const messages = await getChatMessages(db, chatId);
     // access_role/is_owner mirror the project and review detail responses so
     // the client can render per-role affordances instead of re-deriving them.
     res.json({
-        chat: access.chat,
+        chat: { ...access.chat, can_leave: leaveAccess.data[0].can_leave },
         is_owner: access.isCreator,
         access_role: access.projectRole,
         messages,
@@ -166,6 +193,17 @@ chatRouter.get("/:chatId", requireAuth, asyncRoute(async (req, res) => {
         // showing the hidden reservation as "no answer".
         active_turn: getActiveAssistantTurn(chatId),
     });
+}));
+
+// POST /chat/:chatId/leave — revoke only the authenticated recipient.
+chatRouter.post("/:chatId/leave", requireAuth, asyncRoute(async (req, res) => {
+    const result = await leaveChat(createServerSupabase(), {
+        chatId: req.params.chatId,
+        userId: res.locals.userId as string,
+        userEmail: res.locals.userEmail as string | undefined,
+    });
+    if (!result.ok) return void sendServiceFailure(res, result);
+    res.status(204).end();
 }));
 
 // GET /chat/:chatId/turn/:turnId/stream?from=<seq>
@@ -270,7 +308,9 @@ chatRouter.get("/:chatId/access", requireAuth, asyncRoute(async (req, res) => {
     if (!listed.ok) return void sendInternalError(res, listed.detail);
     res.json({
         scope: "direct",
-        org_id: null,
+        // The organization whose members it can be shared with, or null for
+        // a personal chat, which can be shared with anyone.
+        org_id: await teamOrgIdOf(db, access.chat.org_id),
         access_role: access.projectRole,
         grants: listed.grants,
     });
@@ -399,9 +439,9 @@ chatRouter.patch("/:chatId", requireAuth, asyncRoute(async (req, res) => {
     const access = await getAccessibleChat(db, { chatId, userId, userEmail });
     if (!access.ok)
         return void res.status(404).json({ detail: "Chat not found" });
-    // Title edits are content collaboration (the same tier that may send
-    // messages into the chat).
-    if (title != null && !can(access.projectRole, "content.edit"))
+    // Managing the chat title belongs to owners; editors can still send
+    // messages and choose the model/reasoning used for their responses.
+    if (title != null && !can(access.projectRole, "access.manage"))
         return void res
             .status(403)
             .json({ detail: "You do not have permission to modify this chat" });
@@ -414,6 +454,7 @@ chatRouter.patch("/:chatId", requireAuth, asyncRoute(async (req, res) => {
         chatId,
         userId,
         chatModel: access.chat.model,
+        orgId: access.chat.org_id ?? null,
         ...(title !== undefined ? { title } : {}),
         ...(hasModel
             ? {
@@ -528,6 +569,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         requestedModel: model,
         requestedReasoning: parsedReasoning.value,
         requestedTimeZone: req.body?.time_zone,
+        requestedOrgId: req.body?.org_id,
     });
     if (!prep.ok) {
         if ("internal" in prep) return void sendInternalError(res, prep.error);
@@ -552,6 +594,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         workflowStore,
         legalResearchUs,
         apiKeys,
+        orgId,
         titleModel,
         selectedModel,
         selectedReasoningLevel,
@@ -696,6 +739,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 model: selectedModel,
                 reasoning: selectedReasoningLevel,
                 apiKeys,
+                orgId,
                 signal: stream.signal,
                 projectId: resolvedProjectId,
                 conversationId: chatId,
@@ -836,6 +880,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 db,
                 {
                     userId,
+                    orgId,
                     userEmail,
                     chatId,
                     projectId: resolvedProjectId,
@@ -863,6 +908,7 @@ chatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                     db,
                     {
                         userId,
+                    orgId,
                         userEmail,
                         chatId,
                         projectId: resolvedProjectId,

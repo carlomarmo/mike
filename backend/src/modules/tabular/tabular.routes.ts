@@ -70,7 +70,9 @@ import {
     getTabularReviewAccess,
     getTabularReviewDetail,
     getTabularReviewPeople,
+    getTabularReviewHistoryStatuses,
     grantTabularReviewAccess,
+    listProjectReviewCreators,
     listTabularReviewIds,
     listTabularReviews,
     revokeTabularReviewAccess,
@@ -104,6 +106,10 @@ import {
 } from "../../lib/memory/schedule";
 import { parsePaginationQuery } from "../../lib/pagination";
 import { normalizeSearchTerm } from "../../lib/search";
+import {
+    resolveWorkspaceFilter,
+    sendWorkspaceFailure,
+} from "../../lib/workspace";
 import { parseTabularReviewSort } from "../../lib/sort";
 import { parseTabularReviewScope } from "./tabular.overview";
 
@@ -134,6 +140,13 @@ function sendTabularFailure(res: Response, failure: TabularFailure): void {
  */
 const reviewRunKey = (reviewId: string) => `review:${reviewId}`;
 
+/** `?owner_user_id=` as a creator filter, or null when absent or empty. */
+function ownerUserIdFilterOf(query: Record<string, unknown>): string | null {
+    return typeof query.owner_user_id === "string" && query.owner_user_id
+        ? query.owner_user_id
+        : null;
+}
+
 /** `?project_id=` as a filter, or null when it is absent or empty. */
 function projectIdFilterOf(query: Record<string, unknown>): string | null {
     return typeof query.project_id === "string" && query.project_id
@@ -144,15 +157,36 @@ function projectIdFilterOf(query: Record<string, unknown>): string | null {
 // GET /tabular-review
 tabularRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
     const query = req.query as Record<string, unknown>;
-    const result = await listTabularReviews(createServerSupabase(), {
-        userId: res.locals.userId as string,
+    const db = createServerSupabase();
+    const userId = res.locals.userId as string;
+    const workspace = await resolveWorkspaceFilter(db, userId, query.workspace);
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+    const result = await listTabularReviews(db, {
+        userId,
         userEmail: res.locals.userEmail as string | undefined,
         projectIdFilter: projectIdFilterOf(query),
         scope: parseTabularReviewScope(query.scope),
         pagination: parsePaginationQuery(query),
         searchTerm: normalizeSearchTerm(query.search),
         sort: parseTabularReviewSort(query),
+        workspace: workspace.workspace,
+        includeStatus: query.include === "status",
+        ownerUserIdFilter: ownerUserIdFilterOf(query),
     });
+    if (!result.ok) return void sendTabularFailure(res, result);
+    res.json(result.data);
+}));
+
+// Only small status snapshots; the RPC rechecks review access for every id.
+tabularRouter.get("/history-status", requireAuth, asyncRoute(async (req, res) => {
+    const ids = typeof req.query.ids === "string" ? req.query.ids.split(",") : [];
+    if (ids.length === 0 || ids.length > 100 || ids.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) {
+        return void res.status(400).json({ detail: "Provide between 1 and 100 valid review ids" });
+    }
+    const result = await getTabularReviewHistoryStatuses(
+        createServerSupabase(), res.locals.userId as string,
+        res.locals.userEmail as string | undefined, [...new Set(ids)],
+    );
     if (!result.ok) return void sendTabularFailure(res, result);
     res.json(result.data);
 }));
@@ -163,12 +197,32 @@ tabularRouter.get("/", requireAuth, asyncRoute(async (req, res) => {
 // have to page through full review payloads just to collect checkboxes.
 tabularRouter.get("/ids", requireAuth, asyncRoute(async (req, res) => {
     const query = req.query as Record<string, unknown>;
-    const result = await listTabularReviewIds(createServerSupabase(), {
-        userId: res.locals.userId as string,
+    const db = createServerSupabase();
+    const userId = res.locals.userId as string;
+    const workspace = await resolveWorkspaceFilter(db, userId, query.workspace);
+    if (!workspace.ok) return void sendWorkspaceFailure(res, workspace);
+    const result = await listTabularReviewIds(db, {
+        userId,
         userEmail: res.locals.userEmail as string | undefined,
         projectIdFilter: projectIdFilterOf(query),
         scope: parseTabularReviewScope(query.scope),
         searchTerm: normalizeSearchTerm(query.search),
+        workspace: workspace.workspace,
+        ownerUserIdFilter: ownerUserIdFilterOf(query),
+    });
+    if (!result.ok) return void sendTabularFailure(res, result);
+    res.json(result.data);
+}));
+
+// GET /tabular-review/creators?project_id= (must come before /:reviewId)
+// The people behind a project's reviews, for its Creator filter.
+tabularRouter.get("/creators", requireAuth, asyncRoute(async (req, res) => {
+    const projectId = projectIdFilterOf(req.query as Record<string, unknown>);
+    if (!projectId) return void res.status(400).json({ detail: "project_id is required" });
+    const result = await listProjectReviewCreators(createServerSupabase(), {
+        projectId,
+        userId: res.locals.userId as string,
+        userEmail: res.locals.userEmail as string | undefined,
     });
     if (!result.ok) return void sendTabularFailure(res, result);
     res.json(result.data);
@@ -952,6 +1006,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
         memorySharedAudience,
         memoryTurn,
         model: selectedChatModel,
+        orgId,
         readableMemoryProjectId,
         reasoningLevel: selectedReasoningLevel,
         reviewTitle,
@@ -1038,6 +1093,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, asyncRoute(async (req, res) =
             model: selectedChatModel,
             reasoning: selectedReasoningLevel,
             apiKeys: api_keys,
+            orgId,
             signal: stream.signal,
             conversationId: chatId,
             includeMemory: true,

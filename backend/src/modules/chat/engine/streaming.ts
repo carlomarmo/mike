@@ -1,3 +1,4 @@
+import { teamOrgIdOf } from "../../../lib/personalOrgs";
 import { buildGoogleWorkspaceTools } from "../../../lib/integrations/googleWorkspace";
 import {
   streamChatWithTools,
@@ -36,6 +37,7 @@ import {
   CITATIONS_OPEN_TAG,
 } from "./citations";
 import { runToolCalls } from "./tools/toolDispatcher";
+import { documentSearchError } from "./tools/documentSearchErrors";
 import {
   getCachedCaseOpinionTexts,
   type CourtlistenerTurnState,
@@ -123,7 +125,9 @@ function sanitizeAssistantEvent(event: AssistantEvent): AssistantEvent {
       : { ...event, message: ASSISTANT_ERROR_MESSAGE };
   }
   if ("error" in event && typeof event.error === "string" && event.error) {
-    return { ...event, error: TOOL_ERROR_MESSAGE };
+    return event.type === "doc_search"
+      ? { ...event, ...documentSearchError(event.error_code) }
+      : { ...event, error: TOOL_ERROR_MESSAGE };
   }
   return event;
 }
@@ -240,6 +244,12 @@ export async function runLLMStream(params: {
   /** AI SDK reasoning effort for this interactive request. */
   reasoning?: import("../../../lib/llm").ReasoningLevel;
   apiKeys?: import("../../../lib/llm").UserApiKeys;
+  /**
+   * The organization the conversation belongs to. `apiKeys` are already the
+   * ones it runs on; this is for the model-list check below, which must use
+   * the same organization's lists.
+   */
+  orgId?: string | null;
   signal?: AbortSignal;
   /** Let a route persist the completed turn before it signals stream success. */
   emitDone?: boolean;
@@ -285,6 +295,7 @@ export async function runLLMStream(params: {
     buildCitations,
     model,
     apiKeys,
+    orgId,
     signal,
     projectId,
     includeMemory = false,
@@ -296,8 +307,10 @@ export async function runLLMStream(params: {
   const write = (chunk: string) =>
     unsafeWrite(sanitizeAssistantSseChunk(chunk));
   const researchTools = includeResearchTools ? COURTLISTENER_TOOLS : [];
-  const mcpTools = await buildUserMcpTools(userId, db);
-  const googleDriveTools = await buildGoogleDriveTools(userId, db);
+  // Account-owned credentials are enabled only in Personal.
+  const personalConnectors = (await teamOrgIdOf(db, orgId)) === null;
+  const mcpTools = personalConnectors ? await buildUserMcpTools(userId, db) : [];
+  const googleDriveTools = personalConnectors ? await buildGoogleDriveTools(userId, db) : [];
   const conversationTools = includeAskInputs
     ? TOOLS
     : TOOLS.filter((tool) => tool.function.name !== "ask_inputs");
@@ -306,7 +319,7 @@ export async function runLLMStream(params: {
     ...baseTools,
     ...mcpTools,
     ...googleDriveTools,
-    ...(await buildGoogleWorkspaceTools(userId, db)),
+    ...(personalConnectors ? await buildGoogleWorkspaceTools(userId, db) : []),
     ...(extraTools ?? []),
     ...(clientTools?.schemas ?? []),
   ];
@@ -334,6 +347,7 @@ export async function runLLMStream(params: {
     systemPrompt: baseSystemPrompt,
     include: includeMemory,
     projectId: memoryProjectId,
+    orgId,
     sharedAudience: memorySharedAudience,
   });
   const systemPrompt = memory.systemPrompt;
@@ -511,6 +525,7 @@ export async function runLLMStream(params: {
       userId,
       db,
       "throw",
+      orgId,
     );
     await streamChatWithTools({
       model: selectedModel,
@@ -605,6 +620,7 @@ export async function runLLMStream(params: {
           toolResults,
           docsRead,
           docsFound,
+          documentSearchEvents,
           docsCreated,
           docsReplicated,
           workflowsApplied,
@@ -631,6 +647,7 @@ export async function runLLMStream(params: {
           {
             connectorApprovals: connectorApprovals && includeAskInputs,
             userEmail,
+            orgId,
           },
         );
         throwIfAborted(signal);
@@ -654,6 +671,7 @@ export async function runLLMStream(params: {
             total_matches: f.total_matches,
           });
         }
+        events.push(...(documentSearchEvents ?? []));
         for (const dl of docsCreated) {
           events.push({
             type: "doc_created",

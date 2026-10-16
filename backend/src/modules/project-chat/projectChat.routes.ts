@@ -146,6 +146,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
         workflowStore,
         legalResearchUs,
         apiKeys,
+        orgId,
         titleModel,
         selectedModel,
         selectedReasoningLevel,
@@ -258,6 +259,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 model: selectedModel,
                 reasoning: selectedReasoningLevel,
                 apiKeys,
+                orgId,
                 signal: stream.signal,
                 projectId,
                 conversationId: chatId,
@@ -358,6 +360,7 @@ projectChatRouter.post("/", requireAuth, asyncRoute(async (req, res) => {
                 db,
                 {
                     userId,
+                    orgId,
                     userEmail,
                     chatId,
                     projectId,

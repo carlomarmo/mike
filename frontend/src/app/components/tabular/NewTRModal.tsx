@@ -1,5 +1,7 @@
 "use client";
 
+import { useWorkspaceIdentity } from "@/app/hooks/useWorkspaceIdentity";
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Upload } from "lucide-react";
 import type { Document, Folder, Project, Workflow } from "../shared/types";
@@ -12,7 +14,12 @@ import {
     uploadStandaloneDocuments,
 } from "@/app/lib/mikeApi";
 import type { AccessAssignmentRole } from "@/app/lib/mikeApi";
-import { userFacingApiError } from "@/app/lib/userFacingError";
+import {
+    useDocumentWorkspace,
+    useWorkspace,
+    useWorkspaceOrgId,
+} from "@/app/contexts/WorkspaceContext";
+import { notifyError, userFacingApiError } from "@/app/lib/userFacingError";
 import {
     SUPPORTED_DOCUMENT_ACCEPT,
     combineUploadWarnings,
@@ -27,16 +34,18 @@ import { ToggleSwitchUI } from "@/shared/ui/ToggleSwitchUI";
 import { ModelToggle } from "../assistant/ModelToggle";
 import {
     isRouterModelSelected,
-    routerSelections,
     type NoModelsReason,
 } from "@/shared/lib/modelCatalog";
 import { useUserProfile } from "@/app/contexts/UserProfileContext";
+import { useModelApiKeys } from "@/app/hooks/useModelApiKeys";
+import { useModelRouterSelections } from "@/app/hooks/useModelRouterSelections";
 import { isModelAvailable } from "@/app/lib/modelAvailability";
 import { NoModelsWarningPopup } from "../popups/NoModelsWarningPopup";
 import { useAuth } from "@/app/contexts/AuthContext";
 import {
     CreateAccessStep,
     type PendingDirectGrant,
+    type PendingOrgOverride,
 } from "../modals/CreateAccessStep";
 import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
@@ -73,7 +82,8 @@ interface Props {
     projectCmNumber?: string | null;
 }
 
-export function NewTRModal({
+/** Collects tabular-review configuration and pending access choices before creating a review. */
+function NewTRModalForWorkspace({
     open,
     onClose,
     onAdd,
@@ -84,6 +94,9 @@ export function NewTRModal({
     projectName,
     projectCmNumber,
 }: Props) {
+    // A document uploaded on its own belongs to the workspace it is
+    // uploaded in.
+    const workspace = useDocumentWorkspace();
     const isProjectMode = projectId !== undefined;
     const [step, setStep] = useState<"details" | "access" | "documents">(
         "details",
@@ -92,13 +105,20 @@ export function NewTRModal({
     const [underProject, setUnderProject] = useState(false);
     const [selectedProjectId, setSelectedProjectId] = useState("");
     const [directGrants, setDirectGrants] = useState<PendingDirectGrant[]>([]);
+    // In an organization's workspace a review started on its own belongs to
+    // that organization and is shared with its members only: they are picked
+    // from the roster here, and given access by address once it exists. The
+    // id is the one the review is created under, so the two cannot disagree.
+    const { activeOrganization } = useWorkspace();
+    const workspaceOrgId = useWorkspaceOrgId() ?? null;
+    const [memberGrants, setMemberGrants] = useState<PendingOrgOverride[]>([]);
     const [selectedModel, setSelectedModel] = useState("");
     const [noModelsWarning, setNoModelsWarning] =
         useState<NoModelsReason | null>(null);
-    const { profile, loading: profileLoading, apiKeysDegraded } =
-        useUserProfile();
+    const { profile, loading: profileLoading } = useUserProfile();
     const { user } = useAuth();
-    const apiKeys = apiKeysDegraded ? undefined : profile?.apiKeys;
+    const apiKeys = useModelApiKeys();
+    const modelRouterSelections = useModelRouterSelections();
     const configuredModels = useConfiguredModels();
     const configuredModelIds = useMemo(
         () => configuredModels.map((model) => model.id),
@@ -129,9 +149,13 @@ export function NewTRModal({
     const [uploadError, setUploadError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const creatingRef = useRef(false);
+    // The project whose files the picker is loading; see handleSelectProject.
+    const projectRequestRef = useRef<string | null>(null);
 
     // Workflow templates
     const [workflows, setWorkflows] = useState<Workflow[]>([]);
+    // Bumped by the "Retry" on a failed template load so the effect refetches.
+    const [workflowReloadKey, setWorkflowReloadKey] = useState(0);
     const [loadingWorkflows, setLoadingWorkflows] = useState(false);
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(
         null,
@@ -157,7 +181,7 @@ export function NewTRModal({
         if (!open) return;
 
         setLoadingWorkflows(true);
-        listWorkflows("tabular")
+        listWorkflows("tabular", workspace ?? "personal")
             .then((workflows) => {
                 devLog("[workflows/ui:tabular-review-modal] loaded", {
                     workflowCount: workflows.length,
@@ -178,26 +202,33 @@ export function NewTRModal({
             .catch((error) => {
                 devLog("[workflows/ui:tabular-review-modal] failed", error);
                 setWorkflows([]);
+                // An empty list reads as "this firm has no templates", so a
+                // failed load has to say that it failed.
+                notifyError(error, {
+                    action: "load the workflow templates",
+                    dedupeKey: "new-review-workflows",
+                    onRetry: () => setWorkflowReloadKey((key) => key + 1),
+                });
             })
             .finally(() => setLoadingWorkflows(false));
 
         if (isProjectMode) preselectedProjectDocsRef.current = false;
-    }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [open, workflowReloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {
         if (!open || !profile?.tabularModel) return;
         const defaultModel = profile.tabularModel;
-        const routerSelectionValid = isRouterModelSelected(
-            defaultModel,
-            routerSelections(profile),
-        );
+        // Unknown lists (an organization's, still loading) preselect nothing.
+        const routerSelectionValid =
+            !!modelRouterSelections &&
+            isRouterModelSelected(defaultModel, modelRouterSelections);
         const providerAvailable =
             !apiKeys ||
             isModelAvailable(defaultModel, apiKeys, configuredModelIds);
         if (routerSelectionValid && providerAvailable) {
             setSelectedModel((current) => current || defaultModel);
         }
-    }, [apiKeys, configuredModelIds, open, profile]);
+    }, [apiKeys, configuredModelIds, modelRouterSelections, open, profile]);
 
     // Preselect every project document once, as soon as they're available —
     // which may be after the modal opened, since the parent's list is empty
@@ -222,19 +253,27 @@ export function NewTRModal({
         handleClose();
     }
 
+    // Also drops a project load still in flight, so it cannot land later.
+    function clearProjectSelection() {
+        projectRequestRef.current = null;
+        setLoadingDocs(false);
+        setSelectedProjectId("");
+        setProjectDocs([]);
+        setProjectFolders([]);
+        setSelectedDocuments([]);
+    }
+
     function handleClose() {
         setStep("details");
         setReviewExists(false);
         setTitle("");
         setUnderProject(false);
-        setSelectedProjectId("");
+        clearProjectSelection();
         setDirectGrants([]);
+        setMemberGrants([]);
         setSelectedModel("");
         setNoModelsWarning(null);
-        setProjectDocs([]);
-        setProjectFolders([]);
         setExtraStandaloneDocs([]);
-        setSelectedDocuments([]);
         setGroupBySubfolder(false);
         setSelectedWorkflowId(null);
         setUploadError(null);
@@ -272,7 +311,21 @@ export function NewTRModal({
             : underProject
               ? selectedProjectId
               : undefined;
-        const assignments = effectiveProjectId ? [] : directGrants;
+        const assignments: PendingDirectGrant[] = effectiveProjectId
+            ? []
+            : workspaceOrgId
+              ? memberGrants.flatMap((grant) =>
+                    grant.role === "deny"
+                        ? []
+                        : [
+                              {
+                                  email: grant.email,
+                                  display_name: null,
+                                  role: grant.role,
+                              },
+                          ],
+                )
+              : directGrants;
         try {
             const partialFailure = await onAdd(
                 title.trim(),
@@ -305,6 +358,11 @@ export function NewTRModal({
     }
 
     async function handleSelectProject(projectId: string) {
+        projectRequestRef.current = projectId;
+        // A slower load for a project the user has since moved away from
+        // must not fill the picker, end its loading state, or raise a notice
+        // whose Retry would switch the picker back.
+        const superseded = () => projectRequestRef.current !== projectId;
         setSelectedProjectId(projectId);
         setProjectDocs([]);
         setProjectFolders([]);
@@ -312,15 +370,26 @@ export function NewTRModal({
         setLoadingDocs(true);
         try {
             const proj = await getProject(projectId);
+            if (superseded()) return;
             setDirectGrants([]);
+            setMemberGrants([]);
             const docs = (proj.documents ?? []).filter(
                 (d) => d.status === "ready",
             );
             setProjectDocs(docs);
             setProjectFolders(proj.folders ?? []);
             setSelectedDocuments(docs);
+        } catch (error) {
+            if (superseded()) return;
+            // Without this the picker just sat there empty, and the rejection
+            // went nowhere because the caller does not await it.
+            notifyError(error, {
+                action: "load this project's files",
+                dedupeKey: `new-review-project:${projectId}`,
+                onRetry: () => void handleSelectProject(projectId),
+            });
         } finally {
-            setLoadingDocs(false);
+            if (!superseded()) setLoadingDocs(false);
         }
     }
 
@@ -353,6 +422,8 @@ export function NewTRModal({
                   )
                 : await uploadStandaloneDocuments(
                       supported.map((file) => ({ file })),
+                      undefined,
+                      workspace,
                   );
             const uploaded = outcomes.flatMap((outcome) =>
                 outcome.status === "completed" && outcome.result
@@ -504,6 +575,7 @@ export function NewTRModal({
                             type: "button",
                             onClick: () => {
                                 setDirectGrants([]);
+                                setMemberGrants([]);
                                 setStep("documents");
                             },
                             disabled: uploading,
@@ -586,9 +658,7 @@ export function NewTRModal({
                                 onChange={setSelectedModel}
                                 apiKeys={apiKeys}
                                 apiKeysLoading={profileLoading && !profile}
-                                routerSelections={
-                                    profile ? routerSelections(profile) : undefined
-                                }
+                                routerSelections={modelRouterSelections}
                                 onNoModelsClick={setNoModelsWarning}
                                 modalInput
                             />
@@ -616,12 +686,7 @@ export function NewTRModal({
                                     checked={underProject}
                                     onCheckedChange={(next) => {
                                         setUnderProject(next);
-                                        if (!next) {
-                                            setSelectedProjectId("");
-                                            setProjectDocs([]);
-                                            setProjectFolders([]);
-                                            setSelectedDocuments([]);
-                                        }
+                                        if (!next) clearProjectSelection();
                                     }}
                                 >
                                     Create under a project
@@ -657,11 +722,15 @@ export function NewTRModal({
                     </div>
                 ) : step === "access" ? (
                     <CreateAccessStep
-                        orgId={null}
+                        orgId={workspaceOrgId}
+                        organizationName={activeOrganization?.name ?? null}
                         currentUserEmail={user?.email ?? null}
+                        currentUserProfile={profile}
                         currentUserId={user?.id ?? null}
                         directGrants={directGrants}
                         onDirectGrantsChange={setDirectGrants}
+                        orgOverrides={memberGrants}
+                        onOrgOverridesChange={setMemberGrants}
                         inheritedFromProject={isProjectMode || underProject}
                         inheritedProjectId={
                             isProjectMode
@@ -671,6 +740,7 @@ export function NewTRModal({
                                   : null
                         }
                         ownerLabel="Review owners"
+                        resourceNoun="review"
                     />
                 ) : (
                     <div className="flex min-h-0 flex-1 flex-col">
@@ -710,4 +780,9 @@ export function NewTRModal({
             />
         </Modal>
     );
+}
+
+export function NewTRModal(props: Props) {
+    const identity = useWorkspaceIdentity();
+    return <NewTRModalForWorkspace key={identity} {...props} />;
 }

@@ -1,8 +1,16 @@
+import type { DocumentSearchEvent } from "@mike/contracts";
+import { internalFailure } from "../../../../lib/serviceResult";
+import { canUseWorkflowInWorkspace } from "../../../../lib/workflowWorkspace";
+import { catalogKeyFromWorkflowId } from "../../../../lib/workflowCatalog";
+import { teamOrgIdOf } from "../../../../lib/personalOrgs";
 import {
   isGoogleWorkspaceTool,
   executeGoogleWorkspaceToolCall,
 } from "../../../../lib/integrations/googleWorkspace";
-import { createDocumentVersions } from "../../../documents/documents.service";
+import { logError } from "../../../../lib/log";
+import { diagnosticErrorTags } from "../../../../lib/observability/sentryPrivacy";
+import { documentSearchFailure } from "./documentSearchErrors";
+import { findDocumentText, createDocumentVersions } from "../../../documents/documents.service";
 import {
   getCourtlistenerCases,
   searchCourtlistenerCaseLaw,
@@ -299,6 +307,12 @@ export async function runToolCalls(
      * edit_document runs (direct grants are keyed by email).
      */
     userEmail?: string | null;
+    /**
+     * The organization the conversation belongs to, if any. A document the
+     * assistant creates outside a project is filed under it, so that work
+     * done in an organization's workspace stays in that organization.
+     */
+    orgId?: string | null;
   } = {},
 ): Promise<{
   toolResults: unknown[];
@@ -317,6 +331,7 @@ export async function runToolCalls(
     total_matches: number;
   }[];
   docsCreated: DocCreatedResult[];
+  documentSearchEvents: DocumentSearchEvent[];
   docsReplicated: DocReplicatedResult[];
   workflowsApplied: { workflow_id: string; title: string }[];
   docsEdited: DocEditedResult[];
@@ -341,6 +356,7 @@ export async function runToolCalls(
     total_matches: number;
   }[] = [];
   const docsCreated: DocCreatedResult[] = [];
+  const documentSearchEvents: DocumentSearchEvent[] = [];
   const docsReplicated: DocReplicatedResult[] = [];
   const workflowsApplied: { workflow_id: string; title: string }[] = [];
   const docsEdited: DocEditedResult[] = [];
@@ -464,6 +480,14 @@ export async function runToolCalls(
       tc.function.name.startsWith(GOOGLE_DRIVE_TOOL_PREFIX) ||
       isGoogleWorkspaceTool(tc.function.name) ||
       tc.function.name.startsWith("mcp_");
+    if (isConnectorTool && (await teamOrgIdOf(db, options.orgId)) !== null) {
+      toolResults.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: "Connectors are available only in the Personal workspace.",
+      });
+      continue;
+    }
     if (isConnectorTool) {
       const plan = await planConnectorToolCall(
         userId,
@@ -609,6 +633,67 @@ export async function runToolCalls(
           ? `${citationReminder(docId, filename, promptFilename)}${sourceNotice ? `\n${sourceNotice}` : ""}\n\n${fencedContent}`
           : fencedContent,
       });
+    } else if (tc.function.name === "find_documents") {
+      const limit = typeof args.limit === "number" && Number.isInteger(args.limit)
+        && args.limit >= 1 && args.limit <= 20 ? args.limit : undefined;
+      const offset = typeof args.offset === "number" && Number.isInteger(args.offset)
+        && args.offset >= 0 && args.offset <= 100000 ? args.offset : undefined;
+      const search: DocumentSearchEvent = {
+        type: "doc_search", search_id: tc.id,
+        scope: typeof args.scope === "string" ? args.scope.slice(0, 32) : "",
+        query: typeof args.query === "string" ? args.query.slice(0, 500) : "",
+        offset: offset ?? 0,
+      };
+      write(`data: ${JSON.stringify({ ...search, type: "doc_search_start" })}\n\n`);
+      const finishSearch = (details: Partial<DocumentSearchEvent>) => {
+        const event = { ...search, ...details };
+        documentSearchEvents.push(event);
+        write(`data: ${JSON.stringify(event)}\n\n`);
+      };
+      const rawDocId = typeof args.doc_id === "string" ? args.doc_id : undefined;
+      const label = rawDocId ? resolveDocLabel(rawDocId, docStore, docIndex) : null;
+      const result = await findDocumentText(db, {
+        userId, userEmail: options.userEmail, workspace: options.orgId ?? "personal",
+        scope: typeof args.scope === "string" ? args.scope : "",
+        query: typeof args.query === "string" ? args.query : "",
+        projectId: args.scope === "project" ? projectId : null,
+        documentId: label ? docIndex?.[label]?.document_id : rawDocId,
+        versionId: typeof args.version_id === "string" ? args.version_id : null,
+        limit, offset,
+      }).catch(internalFailure);
+      if (!result.ok) {
+        const failure = documentSearchFailure(result);
+        logError("find_documents", {
+          category: failure.error_code,
+          ...(result.kind === "error" ? diagnosticErrorTags(result.error) : {}),
+        });
+        finishSearch(failure);
+        toolResults.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify({
+          ok: false, ...failure,
+        }) });
+        continue;
+      }
+      const matches = result.data.matches.map((match) => {
+        // Separate handle per revision: never overwrite an attachment's pinned
+        // historical version, and never interpret retrieved text as tool policy.
+        const docId = `found-${match.version_id}-${match.revision}`;
+        docStore.set(docId, {
+          filename: match.filename, file_type: match.file_type, storage_path: match.storage_path,
+          source_kind: match.library_kind === "template" ? "library_template" : "document",
+          search_source: { revision: match.revision, userId, userEmail: options.userEmail },
+        });
+        if (docIndex) docIndex[docId] = {
+          document_id: match.document_id, filename: match.filename,
+          version_id: match.version_id, version_number: match.version_number,
+        };
+        const { storage_path: _path, ...publicMatch } = match;
+        return { ...publicMatch, doc_id: docId };
+      });
+      const content = JSON.stringify({ ok: true, ...result.data, matches });
+      finishSearch({ match_count: matches.length, next_offset: result.data.next_offset,
+        coverage: result.data.coverage });
+      toolResults.push({ role: "tool", tool_call_id: tc.id,
+        content: nonce ? spotlight(content, nonce) : content });
     } else if (tc.function.name === "find_in_document") {
       const rawDocId = args.doc_id as string;
       const docId = resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
@@ -764,7 +849,15 @@ export async function runToolCalls(
       });
     } else if (tc.function.name === "read_workflow") {
       const wfId = args.workflow_id as string;
-      const wf = workflowStore?.get(wfId);
+      const candidate = workflowStore?.get(wfId);
+      const allowed = candidate && (
+        catalogKeyFromWorkflowId(wfId) !== null ||
+        await canUseWorkflowInWorkspace(
+          db, wfId, userId, options.userEmail,
+          (await teamOrgIdOf(db, options.orgId)) ?? "personal",
+        )
+      );
+      const wf = allowed ? candidate : undefined;
       if (wf) {
         write(
           `data: ${JSON.stringify({ type: "workflow_applied", workflow_id: wfId, title: wf.title })}\n\n`,
@@ -1537,6 +1630,7 @@ export async function runToolCalls(
           if (currentDocStore) {
             docStore.set(docId, {
               ...currentDocStore,
+              search_source: undefined,
               storage_path: result.storage_path,
             });
           }
@@ -1754,6 +1848,9 @@ export async function runToolCalls(
             const docRows = newDocs.map((d) => ({
               id: d.id,
               project_id: projectId ?? null,
+              // Outside a project: the conversation's organization. Inside
+              // one the database stamps the project's.
+              org_id: options.orgId ?? null,
               user_id: userId,
               status: "ready",
               library_kind: "file",
@@ -1963,7 +2060,12 @@ export async function runToolCalls(
         args.sections as unknown[],
         userId,
         db,
-        { landscape, numberSections, projectId: projectId ?? null },
+        {
+          landscape,
+          numberSections,
+          projectId: projectId ?? null,
+          orgId: options.orgId ?? null,
+        },
       );
       registerGeneratedDocument(
         tc,
@@ -1983,7 +2085,7 @@ export async function runToolCalls(
         args.sheets as unknown[],
         userId,
         db,
-        { projectId: projectId ?? null },
+        { projectId: projectId ?? null, orgId: options.orgId ?? null },
       );
       registerGeneratedDocument(
         tc,
@@ -2003,7 +2105,7 @@ export async function runToolCalls(
         args.slides as unknown[],
         userId,
         db,
-        { projectId: projectId ?? null },
+        { projectId: projectId ?? null, orgId: options.orgId ?? null },
       );
       registerGeneratedDocument(
         tc,
@@ -2055,6 +2157,7 @@ export async function runToolCalls(
     docsRead,
     docsFound,
     docsCreated,
+    documentSearchEvents,
     docsReplicated,
     workflowsApplied,
     docsEdited,

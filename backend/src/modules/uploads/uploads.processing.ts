@@ -14,7 +14,7 @@ import {
 
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Transform } from "node:stream";
@@ -22,7 +22,7 @@ import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 import JSZip from "jszip";
-import { XMLParser } from "fast-xml-parser";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 
 import { resolveContentOrgId } from "../../lib/access";
 import { recordAudit } from "../../lib/audit";
@@ -35,11 +35,11 @@ import {
 } from "../../lib/observability/pollFailureGate";
 import { asReportableError } from "../../lib/httpError";
 import { shouldConvertToPdf } from "../../lib/documentTypes";
+import { countPagesWithoutText } from "../../lib/pdfText";
 import { uploadJobWallClockMs } from "../../lib/runtimeConfig";
 import {
   copyFile,
   createFileReadStream,
-  deleteFile,
   deleteFileBestEffort,
   deleteFilesBestEffort,
   StorageOperationError,
@@ -200,6 +200,22 @@ async function countPdfPages(filePath: string): Promise<number | null> {
   }
 }
 
+// Measured once at upload so the document list can flag scanned PDFs without
+// re-reading them. Null when the PDF cannot be parsed.
+async function countTextlessPdfPages(filePath: string): Promise<number | null> {
+  try {
+    const bytes = await readFile(filePath);
+    return await countPagesWithoutText(
+      bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer,
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function buildPdfRendition(args: {
   sourceFilePath: string;
   workingDirectory: string;
@@ -216,9 +232,11 @@ async function buildPdfRendition(args: {
       args.sourceFilePath,
       args.workingDirectory,
     );
-    const key = args.versionSlug
-      ? `converted-pdfs/${args.userId}/${args.documentId}/${args.versionSlug}.pdf`
-      : convertedPdfKey(args.userId, args.documentId);
+    const key = convertedPdfKey(
+      args.userId,
+      args.documentId,
+      args.versionSlug,
+    );
     await uploadFileFromPath(key, pdfPath, "application/pdf");
     return key;
   } catch (error) {
@@ -327,15 +345,96 @@ async function requireSealedFile(
 const DOCX_MAIN_DOCUMENT_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 const DOCX_CONTENT_TYPES_MAX_BYTES = 256 * 1024;
-const contentTypesParser = new XMLParser({
+const docxXmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
+  trimValues: false,
+  // Preserve namespace identity while retaining prior text/attribute trimming.
+  tagValueProcessor: (_name, value) => value.trim(),
+  attributeValueProcessor: (name, value) =>
+    name === "xmlns" || name.startsWith("xmlns:") ? value : value.trim(),
+  processEntities: false,
+  ignoreDeclaration: true,
+  ignorePiTags: true,
 });
 
-type DocxContentTypeOverride = {
-  "@_PartName"?: string;
-  "@_ContentType"?: string;
-};
+type XmlElement = Record<string, unknown>;
+
+function parseDocxXml(xml: string): XmlElement {
+  // Package XML must not define entities or depend on an external DTD.
+  if (/<!DOCTYPE\b/i.test(xml) || XMLValidator.validate(xml) !== true) {
+    throw new InvalidUploadedFileError();
+  }
+  return docxXmlParser.parse(xml) as XmlElement;
+}
+
+function xmlChildren(
+  parent: XmlElement,
+  localName: string,
+  namespace: string,
+): XmlElement[] {
+  return Object.entries(parent).flatMap(([name, values]) => {
+    if (name.startsWith("@_") || name.startsWith("#")) return [];
+    // XMLValidator accepts XML Names with extra colons, not just QNames.
+    const parts = name.split(":");
+    if (parts.length > 2 || parts.some((part) => !part)) {
+      throw new InvalidUploadedFileError();
+    }
+    const [prefix, local] = parts.length === 2 ? parts : ["", name];
+    if (local !== localName) return [];
+    const namespaceAttribute = prefix ? `@_xmlns:${prefix}` : "@_xmlns";
+    return (Array.isArray(values) ? values : [values]).flatMap((value) => {
+      const element = value !== null && typeof value === "object"
+        ? value as XmlElement
+        : {};
+      return (element[namespaceAttribute] ?? parent[namespaceAttribute]) === namespace
+        ? [element]
+        : [];
+    });
+  });
+}
+
+function hasDocxMainRelationship(xml: string): boolean {
+  const parsed = parseDocxXml(xml);
+  const namespace = "http://schemas.openxmlformats.org/package/2006/relationships";
+  const roots = xmlChildren(parsed, "Relationships", namespace);
+  if (Object.keys(parsed).length !== 1 || roots.length !== 1) return false;
+  const root = roots[0]!;
+  const relationships = xmlChildren(root, "Relationship", namespace).filter(
+    (relationship) => [
+      "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+      "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument",
+    ].includes(String(relationship["@_Type"])),
+  );
+  if (relationships.length !== 1) return false;
+  const relationship = relationships[0]!;
+  if (
+    relationship["@_TargetMode"] !== undefined &&
+    relationship["@_TargetMode"] !== "Internal"
+  ) return false;
+  const target = relationship["@_Target"];
+  if (
+    typeof target !== "string" || !target ||
+    target.startsWith("//") || /[\\:?#]/.test(target)
+  ) return false;
+  // Resolve a package-relative URI only; this never opens a URL.
+  const resolved = new URL(target, "https://docx.invalid/");
+  return resolved.origin === "https://docx.invalid" &&
+    resolved.pathname === "/word/document.xml";
+}
+
+function hasDocxMainDocument(xml: string): boolean {
+  const parsed = parseDocxXml(xml);
+  if (Object.keys(parsed).length !== 1) return false;
+  return [
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "http://purl.oclc.org/ooxml/wordprocessingml/main",
+  ].some((namespace) => {
+    const documents = xmlChildren(parsed, "document", namespace);
+    return documents.length === 1 &&
+      xmlChildren(documents[0]!, "body", namespace).length === 1;
+  });
+}
 
 function zipEntryUncompressedSize(entry: JSZip.JSZipObject): number | null {
   const data = (entry as JSZip.JSZipObject & {
@@ -368,7 +467,9 @@ async function readZipEntryBounded(
 
   const chunks: Buffer[] = [];
   let actualSize = 0;
-  const stream = entry.internalStream("nodebuffer") as unknown as BoundedZipEntryStream;
+  const stream = (entry as JSZip.JSZipObject & {
+    internalStream(type: "nodebuffer"): BoundedZipEntryStream;
+  }).internalStream("nodebuffer");
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -399,17 +500,21 @@ async function readZipEntryBounded(
   if (actualSize !== declaredSize) {
     throw new InvalidUploadedFileError();
   }
-  return Buffer.concat(chunks, actualSize).toString("utf8");
+  const bytes = Buffer.concat(chunks, actualSize);
+  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe
+    ? "utf-16le"
+    : bytes[0] === 0xfe && bytes[1] === 0xff
+      ? "utf-16be"
+      : "utf-8";
+  return new TextDecoder(encoding, { fatal: true }).decode(bytes);
 }
 
 function hasDocxMainDocumentOverride(contentTypes: string): boolean {
-  const parsed = contentTypesParser.parse(contentTypes) as {
-    Types?: {
-      Override?: DocxContentTypeOverride | DocxContentTypeOverride[];
-    };
-  };
-  const overrides = parsed.Types?.Override;
-  return (Array.isArray(overrides) ? overrides : overrides ? [overrides] : []).some(
+  const parsed = parseDocxXml(contentTypes);
+  const namespace = "http://schemas.openxmlformats.org/package/2006/content-types";
+  const roots = xmlChildren(parsed, "Types", namespace);
+  if (Object.keys(parsed).length !== 1 || roots.length !== 1) return false;
+  return xmlChildren(roots[0]!, "Override", namespace).some(
     (override) =>
       override["@_PartName"] === "/word/document.xml" &&
       override["@_ContentType"] === DOCX_MAIN_DOCUMENT_CONTENT_TYPE,
@@ -443,6 +548,19 @@ async function validateUploadedFilePackage(
       DOCX_CONTENT_TYPES_MAX_BYTES,
     );
     if (!hasDocxMainDocumentOverride(contentTypes)) {
+      throw new InvalidUploadedFileError();
+    }
+    const relationships = await readZipEntryBounded(
+      relationshipsPart,
+      DOCX_CONTENT_TYPES_MAX_BYTES,
+    );
+    if (!hasDocxMainRelationship(relationships)) {
+      throw new InvalidUploadedFileError();
+    }
+    // Main document XML can be much larger than package metadata. Reuse the
+    // upload ceiling instead of imposing the small metadata limit on it.
+    const document = await readZipEntryBounded(documentPart, MAX_UPLOAD_SIZE_BYTES);
+    if (!hasDocxMainDocument(document)) {
       throw new InvalidUploadedFileError();
     }
   } catch (error) {
@@ -505,6 +623,11 @@ async function processCreatedDocument(
       .maybeSingle();
     if (workflowError) throw new Error(workflowError.message);
     orgId = (workflowRow as { org_id?: string | null } | null)?.org_id ?? null;
+  }
+  if (!orgId && (scope === "standalone" || scope === "library")) {
+    // Uploaded on its own: the workspace the session named, which was
+    // checked against the uploader's memberships when it was opened.
+    orgId = (destination.org_id as string | null | undefined) ?? null;
   }
 
   // The upsert below is what makes a retry idempotent — and, on a retry, what
@@ -570,6 +693,10 @@ async function processCreatedDocument(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
 
   const { error: versionError } = await createDocumentVersion(db, {
     id: versionId,
@@ -582,6 +709,7 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // The document went while we were converting: stop, and hand the bytes we
@@ -608,6 +736,7 @@ async function processCreatedDocument(
     userId: session.user_id,
     userEmail: session.user_email,
     action: "document.uploaded",
+    orgId: document.org_id ?? null,
     title: file.filename,
     surface: projectId ? "project" : "assistant",
     projectId,
@@ -626,6 +755,7 @@ async function processCreatedDocument(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     active_version_number: 1,
   };
 }
@@ -660,6 +790,10 @@ async function processNewDocumentVersion(
   });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
 
   const { data: version, error } = await createDocumentVersion(db, {
     id: versionId,
@@ -672,6 +806,7 @@ async function processNewDocumentVersion(
     file_type: file.file_type,
     size_bytes: artifact.size,
     page_count: pageCount,
+    textless_page_count: textlessPageCount,
     content_sha256: artifact.sha256,
   });
   // Adding a version to a document that has been deleted is the same race as
@@ -690,6 +825,7 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
+    textless_page_count,
   } = version;
   return {
     id,
@@ -700,6 +836,7 @@ async function processNewDocumentVersion(
     file_type,
     size_bytes,
     page_count,
+    textless_page_count,
   };
 }
 
@@ -770,6 +907,10 @@ async function processReplacementDocumentVersion(
       });
   const pageCount =
     file.file_type === "pdf" ? await countPdfPages(artifact.filePath) : null;
+  const textlessPageCount =
+    file.file_type === "pdf"
+      ? await countTextlessPdfPages(artifact.filePath)
+      : null;
   const { data: updated, error } = await updateDocumentVersion(
     db,
     documentId,
@@ -781,9 +922,7 @@ async function processReplacementDocumentVersion(
       file_type: file.file_type,
       size_bytes: artifact.size,
       page_count: pageCount,
-      // This value belongs to the previous file's extracted text. Replacement
-      // uploads do not recompute it, so retaining it would expose stale metadata.
-      textless_page_count: null,
+      textless_page_count: textlessPageCount,
       content_sha256: artifact.sha256,
       created_at: new Date().toISOString(),
     },

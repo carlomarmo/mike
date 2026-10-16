@@ -36,6 +36,12 @@ vi.mock("@/app/contexts/ChatHistoryContext", () => ({
         updateChatTitle: updateChatTitleMock,
     }),
 }));
+const workspaceOrg = vi.hoisted(() => ({ id: undefined as string | undefined }));
+vi.mock("@/app/contexts/WorkspaceContext", async importOriginal => ({
+  ...await importOriginal<typeof import("@/app/contexts/WorkspaceContext")>(),
+    useWorkspaceOrgId: () => workspaceOrg.id,
+}));
+
 import { useAssistantChat } from "./useAssistantChat";
 
 const fetchMock = vi.fn();
@@ -76,6 +82,7 @@ const sendAndGetAssistant = async (chunks: string[]) => {
 };
 
 beforeEach(() => {
+    workspaceOrg.id = undefined;
     vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -85,6 +92,23 @@ afterEach(() => {
 });
 
 describe("useAssistantChat SSE parsing", () => {
+    // The first message of a chat started on its own is what creates it, so
+    // it carries the workspace the chat is started in.
+    it("names the active organization when a chat is started in its workspace", async () => {
+        workspaceOrg.id = "org-1";
+        await sendAndGetAssistant(["data: [DONE]\n\n"]);
+        const request = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+        expect(JSON.parse(request.body as string)).toMatchObject({
+            org_id: "org-1",
+        });
+    });
+
+    it("names no organization for a chat started in Personal", async () => {
+        await sendAndGetAssistant(["data: [DONE]\n\n"]);
+        const request = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+        expect(JSON.parse(request.body as string)).not.toHaveProperty("org_id");
+    });
+
     it("continues a project input request with its parent id, attachments and displayed document", async () => {
         fetchMock.mockResolvedValue(sseResponse(["data: [DONE]\n\n"]));
         const response = {
@@ -112,6 +136,35 @@ describe("useAssistantChat SSE parsing", () => {
             displayed_doc: { filename: "Comparison.docx", document_id: "project-doc-1" },
             messages: [expect.anything(), expect.objectContaining({ role: "user", files })],
         });
+    });
+
+    it("reports acceptance while the answer is still streaming, and never for a refused send", async () => {
+        const encoder = new TextEncoder();
+        let close!: () => void;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                close = () => {
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                };
+            },
+        });
+        fetchMock.mockResolvedValueOnce(new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+        const onAccepted = vi.fn();
+        const { result } = renderHook(() => useAssistantChat({ chatId: "chat-1" }));
+        let finished = false;
+        let pending!: Promise<unknown>;
+        act(() => {
+            pending = result.current.handleChat(userMessage(), { onAccepted }).then(() => { finished = true; });
+        });
+        await waitFor(() => expect(onAccepted).toHaveBeenCalledOnce());
+        expect(finished).toBe(false);
+        await act(async () => { close(); await pending; });
+
+        const refused = vi.fn();
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ detail: "Forbidden" }), { status: 403 }));
+        await act(async () => { await result.current.handleChat(userMessage("again"), { onAccepted: refused }); });
+        expect(refused).not.toHaveBeenCalled();
     });
 
     it("creates a project chat only when the first message is submitted", async () => {

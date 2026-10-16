@@ -18,6 +18,10 @@ import {
   type RouterSelections,
 } from "@/shared/lib/modelCatalog";
 import type { ApiKeyState } from "@/app/lib/mikeApi";
+import {
+  PERSONAL_WORKSPACE,
+  useWorkspace,
+} from "@/app/contexts/WorkspaceContext";
 import { useOllamaModels } from "@/app/hooks/useOllamaModels";
 import { useConfiguredModels } from "@/app/hooks/useConfiguredModels";
 
@@ -53,6 +57,7 @@ interface Props {
   tone?: "muted" | "default";
   /** Render as a full-width liquid-glass control inside a modal form. */
   modalInput?: boolean;
+  toolbar?: boolean;
   /** Extra classes for the compact trigger button, for a host row's sizing. */
   triggerClassName?: string;
   onNoModelsClick?: (reason: NoModelsReason) => void;
@@ -69,6 +74,7 @@ export function ModelToggle({
   compact = false,
   tone,
   modalInput = false,
+  toolbar = false,
   triggerClassName,
   onNoModelsClick,
   reasoningLevel,
@@ -111,7 +117,14 @@ export function ModelToggle({
     ? (models.find((model) => model.id === value)?.label ?? "Select model")
     : (selected?.label ??
       (availableModels.length > 0 ? "Select model" : "No Models"));
-  const emptyReason = noModelsReason(apiKeys, routerSelections);
+  // In an organization workspace the keys and model lists are its admins'
+  // to set, so an empty picker says who can fix it.
+  const { workspaceId, orgApiKeys } = useWorkspace();
+  const organization =
+    workspaceId !== null && workspaceId !== PERSONAL_WORKSPACE && orgApiKeys
+      ? { allowPersonalKeys: orgApiKeys.allow_personal_api_keys }
+      : null;
+  const emptyReason = noModelsReason(apiKeys, routerSelections, organization);
   return (
     <ModelToggleUI
       value={value}
@@ -123,6 +136,7 @@ export function ModelToggle({
       compact={compact}
       tone={tone}
       modalInput={modalInput}
+      toolbar={toolbar}
       triggerClassName={triggerClassName}
       emptyLabel="No Models"
       onEmptyClick={
